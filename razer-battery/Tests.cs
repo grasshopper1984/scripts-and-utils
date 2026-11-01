@@ -1,7 +1,10 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace RazerBattery
@@ -19,6 +22,8 @@ namespace RazerBattery
                 Directory.CreateDirectory(output);
                 ProtocolTests();
                 StateTests();
+                HardwareTests();
+                PollerTests();
                 SettingsTests(output);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -132,8 +137,81 @@ namespace RazerBattery
             var loaded = WidgetSettings.Load(path);
             Check(loaded.Position == settings.Position && !loaded.TopMost, "Restore negative monitor coordinates and pin preference");
             var area = new Rectangle(-1920, 0, 1920, 1040);
-            Rectangle clamped = BatteryWidget.ClampToScreen(new Rectangle(10000, -10000, 204, 80), area);
+            Rectangle clamped = BatteryWidget.ClampToScreen(new Rectangle(10000, -10000, 264, 112), area);
             Check(area.Contains(clamped), "Recover a widget after its saved monitor disappears");
+        }
+
+        private static void HardwareTests()
+        {
+            Check(Marshal.SizeOf(typeof(HardwareReader.PdhValue)) == 16 &&
+                Marshal.OffsetOf(typeof(HardwareReader.PdhValue), "Number").ToInt32() == 8, "PDH native union ABI");
+            var cpu = new CpuUsage();
+            Check(!cpu.Sample(100, 150, 50).HasValue, "CPU usage needs an interval, not time since boot");
+            Check(cpu.Sample(150, 250, 150) == 75, "CPU kernel time includes idle; fixture is 75% busy");
+            Check(cpu.Sample(250, 350, 150) == 0, "Idle CPU is valid zero");
+            Check(cpu.Sample(250, 400, 200) == 100, "Fully busy CPU");
+            Check(!cpu.Sample(250, 400, 200).HasValue, "No elapsed CPU time is unknown");
+            Check(!cpu.Sample(0, 0, 0).HasValue, "Counter regression is unknown, not overflow");
+            cpu.Reset();
+            Check(!cpu.Sample(100, 200, 300).HasValue, "Resume/hide gap resets the CPU baseline");
+            Check(!cpu.Sample(1000, 201, 301).HasValue, "Reject inconsistent idle and total deltas");
+            Check(Math.Abs(HardwareReading.Celsius(3352).Value - 62.05) < 0.00001, "Tenths Kelvin converts to Celsius");
+            Check(!HardwareReading.Celsius(null).HasValue && !HardwareReading.Celsius(0).HasValue &&
+                !HardwareReading.Celsius(65535).HasValue, "Missing or invalid firmware temperatures stay unavailable");
+            Check(HardwareReading.CpuFrequency(1512, 300) == 4536, "CPU frequency retains turbo above nominal");
+            Check(!HardwareReading.CpuFrequency(1512, null).HasValue && !HardwareReading.CpuFrequency(0, 100).HasValue,
+                "Do not show nominal CPU frequency when the performance estimate is unavailable");
+            Check(!HardwareReading.InRange(Double.NaN, 0, 100).HasValue &&
+                !HardwareReading.InRange(Double.PositiveInfinity, 0, 100).HasValue &&
+                !HardwareReading.InRange(101, 0, 100).HasValue, "Reject nonfinite and out-of-range readings");
+            Check(HardwareReading.InRange(0, 0, 100) == 0, "Zero GPU load is valid");
+            Check(HardwareReading.Temperature(null) == "--" && HardwareReading.Percent(0) == "0%" &&
+                HardwareReading.Clock(4536) == "4.54 GHz", "Display distinguishes missing values and zero, with clock units");
+        }
+
+        private static void PollerTests()
+        {
+            using (var entered = new ManualResetEvent(false))
+            using (var release = new ManualResetEvent(false))
+            {
+                int reads = 0, closes = 0;
+                var poller = new HardwarePoller(delegate
+                {
+                    Interlocked.Increment(ref reads);
+                    entered.Set();
+                    if (!release.WaitOne(5000)) throw new TimeoutException("Test read release");
+                    return new HardwareReading();
+                }, delegate { Interlocked.Increment(ref closes); });
+                try
+                {
+                    var task = poller.Begin();
+                    Check(task != null && entered.WaitOne(5000), "Sensor read starts on a worker");
+                    Check(poller.Begin() == null && reads == 1, "Slow reads cannot queue or overlap");
+                    poller.Dispose();
+                    Check(!poller.Cleanup.IsCompleted && poller.Begin() == null,
+                        "Closing returns while a read is blocked and prevents new reads");
+                    release.Set();
+                    Check(poller.Cleanup.Wait(5000) && closes == 1, "Cleanup follows the last native read");
+                    poller.Dispose();
+                    Check(closes == 1, "Repeated disposal does not shut the driver down twice");
+                }
+                finally { release.Set(); poller.Dispose(); poller.Cleanup.Wait(5000); }
+            }
+            int attempts = 0;
+            var retry = new HardwarePoller(delegate
+            {
+                if (++attempts == 1) throw new InvalidOperationException("Simulated sensor failure");
+                return new HardwareReading { CpuLoad = 25 };
+            }, delegate { });
+            var failed = retry.Begin();
+            bool observed = false;
+            try { failed.GetAwaiter().GetResult(); } catch (InvalidOperationException) { observed = true; }
+            retry.Complete(failed);
+            var recovered = retry.Begin();
+            Check(observed && recovered.GetAwaiter().GetResult().CpuLoad == 25, "A failed read permits recovery on the next tick");
+            retry.Complete(recovered);
+            retry.Dispose();
+            Check(retry.Cleanup.Wait(5000), "Idle cleanup completes on the worker");
         }
 
         private static void RenderTests(string output)
@@ -144,7 +222,9 @@ namespace RazerBattery
                 foreach (uint dpi in new uint[] { 96, 144, 192 })
                 {
                     widget.SetDpi(dpi);
-                    Check(widget.ClientSize == new Size((int)(204 * dpi / 96), (int)(80 * dpi / 96)), "DPI-sized widget");
+                    Check(widget.ClientSize == new Size((int)(264 * dpi / 96), (int)(112 * dpi / 96)), "DPI-sized widget");
+                    widget.ApplyHardware(new HardwareReading { CpuLoad = 35, CpuMHz = 4320, GpuLoad = 96,
+                        GpuMHz = 1470, GpuTemperature = 74, SystemTemperature = 63.05 }, Stopwatch.GetTimestamp());
                     widget.ApplyReading(new BatteryReading { Percent = 64, Charging = true, Connection = "USB" });
                     SavePreview(widget, Path.Combine(output, "charging-" + dpi + ".png"));
                 }
@@ -156,6 +236,16 @@ namespace RazerBattery
                 SavePreview(widget, Path.Combine(output, "stale.png"));
                 widget.ApplyReading(new BatteryReading { Percent = 100, Charging = false, Connection = "USB" });
                 SavePreview(widget, Path.Combine(output, "full.png"));
+                widget.ApplyHardware(new HardwareReading { CpuLoad = 100, CpuMHz = 4999, GpuLoad = 100,
+                    GpuMHz = 10500, GpuTemperature = 100, SystemTemperature = 150 }, Stopwatch.GetTimestamp());
+                Check(widget.HardwareIsFresh && widget.AccessibleDescription.Contains("sensor mapping is unverified"),
+                    "Accessibility identifies system temperature without claiming it is a CPU sensor");
+                SavePreview(widget, Path.Combine(output, "hardware-wide-values.png"));
+                widget.ApplyHardware(new HardwareReading { CpuLoad = 25, CpuMHz = 3300 }, Stopwatch.GetTimestamp());
+                SavePreview(widget, Path.Combine(output, "hardware-partial.png"));
+                widget.ApplyHardware(new HardwareReading { CpuLoad = 25 }, Stopwatch.GetTimestamp() - 11 * Stopwatch.Frequency);
+                Check(!widget.HardwareIsFresh && widget.AccessibleDescription.Contains("stale"), "Old sensor values are not presented as current");
+                SavePreview(widget, Path.Combine(output, "hardware-stale.png"));
             }
             using (var widget = new BatteryWidget(null, null))
             {

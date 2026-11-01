@@ -1,6 +1,6 @@
-# Razer battery widget
+# Razer battery and system widget
 
-A small, draggable Windows desktop widget for **Razer Cobra HyperSpeed**. Shows battery percentage and charging status, with a percentage icon in the notification area. One portable executable, built with Windows' included .NET Framework compiler. No package downloads, installer, service, browser, or Synapse dependency.
+A small, draggable Windows desktop widget for **Razer Cobra HyperSpeed**, with CPU load/clock, NVIDIA GPU load/clock/temperature, and a Windows firmware temperature reading. The notification-area icon continues to show mouse battery percentage. One portable executable, built with Windows' included .NET Framework compiler. No package downloads, installer, extra driver, service, browser, sensor library, or Synapse dependency.
 
 ## Run
 
@@ -23,13 +23,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 - **Ctrl+R** refreshes; **Esc** hides. Windows may initially put the tray icon in the overflow menu.
 - Optional startup: put a shortcut to the executable in `shell:startup` using File Explorer. Startup is not installed automatically.
 
-The widget is 204 x 80 logical pixels and scales with the monitor. It polls once per minute, on launch, on resume, and on manual refresh. Reads run on one background task at a time. There are no animations or network requests. Configuration contains only position and the pin preference in `%LOCALAPPDATA%\RazerBatteryWidget\settings.txt`. To remove it, exit and delete the executable and that optional settings folder.
+The widget is 264 x 112 logical pixels and scales with the monitor. The top row shows mouse battery and system temperature (**SYS**); the two rows below show **CPU in blue** and **GPU in magenta**, with aligned load and clock columns. A small lightning bolt indicates charging. There are no hover popups or descriptive text lines; reading details remain available to accessibility tools.
+
+Mouse battery polls once per minute, on launch, on resume, and on manual refresh. Hardware readings update every two seconds while the widget is visible; hiding it pauses hardware polling. Each reader permits only one background task at a time. Slow hardware reads do not block the UI or mouse-battery polling. There are no animations or network requests. Configuration contains only position and the pin preference in `%LOCALAPPDATA%\RazerBatteryWidget\settings.txt`. To remove it, exit and delete the executable and that optional settings folder.
+
+## Hardware readings
+
+- **CPU:** busy time across all logical processors, plus estimated average clock while executing instructions. Clock uses Windows' `% Processor Performance` relative to nominal MHz, including turbo above 100%; it is not a per-core instantaneous clock. CPU load measures time busy and can differ from Task Manager's frequency-adjusted utilization.
+- **GPU:** the first NVIDIA GPU exposed by the installed driver's `nvml.dll` in Windows System32. Shows its utilization, graphics clock, and GPU temperature. It does not monitor an Intel integrated GPU or launch `nvidia-smi`/PowerShell on each update. NVML utilization may differ from Task Manager's busiest-engine GPU percentage.
+- **System temp:** Windows' `Thermal Zone Information(\_TZ.TZ00)\High Precision Temperature`, converted from tenths of Kelvin. This is a machine-specific firmware zone; its mapping to a CPU package or board sensor has **not** been established. It is deliberately not labelled CPU temperature. Firmware controls how often its value actually changes.
+
+These readings work as a normal user on the tested machine. Missing counters, unsupported NVIDIA readings, or absent driver libraries show `--`; failures do not become a fabricated zero or retain an old value as current. A blocked read older than ten seconds also shows `--`. CPU rate counters need two samples after launch or a long pause. Resume resets the sampling baseline and driver connection. Failed NVIDIA initialization is retried at most once every 30 seconds.
+
+This implementation reads the existing Windows and NVIDIA interfaces. It does not access CPU model-specific registers, install a privileged sensor driver, or claim verified CPU die temperature.
 
 ## Device support
 
 Specifically supports Cobra HyperSpeed over USB (`1532:00DA`) and its 2.4 GHz receiver (`1532:00DB`). Other Razer products and Bluetooth are not queried. When both supported connections are present, a successful cable reading takes priority. Support is intended for one mouse.
 
-A failed read keeps the last successful percentage in grey and labels it **Last known**. Hover for the last read time and error. With no previous reading it shows `--`. Charging becomes unknown if that separate query fails. Battery history is kept in memory only. An explicit successful 0% report is treated as empty, not disconnected.
+A failed read keeps the last successful percentage in grey. The short tray label identifies it as **last known**, and accessibility tools can read the last successful read time and error. With no previous reading it shows `--`. Charging becomes unknown if that separate query fails. Battery history is kept in memory only. An explicit successful 0% report is treated as empty, not disconnected.
 
 If the mouse sleeps, wake it and choose **Refresh now**. For persistent read failures, reconnect its cable/receiver; compare with Synapse closed if necessary. The app never stops Synapse or changes mouse settings.
 
@@ -38,15 +50,25 @@ If the mouse sleeps, wake it and choose **Refresh now**. For persistent read fai
 ```powershell
 .\build.ps1 -Test          # Protocol/state checks and UI rendering at 100%, 150%, 200%
 .\build.ps1 -Probe         # Read the actual connected mouse; nonzero exit if unavailable
+.\build.ps1 -HardwareProbe # Check all six hardware readings; first CPU sample is unknown
 .\bin\BatteryProbe.exe    # Repeat just the live probe without rebuilding
+.\bin\HardwareProbe.exe   # Repeat the hardware probe without rebuilding
 ```
 
-Exit the widget before rebuilding. `bin/` and `test-output/` are ignored by Git. Tests use synthetic data; the probe prints only the model, product ID, report length, percentage, charging, and connection, without device paths or serial numbers. A restricted execution sandbox may hide HID devices even when an ordinary Windows user can read them.
+Exit the widget before rebuilding, or use `-OutputDirectory .\bin\preview` to build a separate copy for validation. `bin/` and `test-output/` are ignored by Git. Tests use synthetic data; probes print readings without device paths or serial numbers. A restricted execution sandbox may hide HID devices and Windows performance counters even when an ordinary Windows user can read them.
 
-Validation on 2026-11-01: warning-free build; 297 assertions passed; rendered normal, low, stale, full, and disconnected states were inspected; a real Cobra HyperSpeed returned battery and charging over USB. The running widget's window was confirmed visible, and a second launch exited while preserving one instance. The executable was 24,064 bytes. One local 75-second idle sample used about 42 MiB of resident memory (24 MiB private) and 0.016 CPU-seconds; these are observations, not performance guarantees. Physical receiver/Bluetooth behavior, unplug/replug, and moving between actual monitors were not tested. Bluetooth is unsupported. Source, filenames, and documentation passed a credential-pattern scan and manual public-data review; generated files stay ignored.
+Tests cover battery protocol/state, sensor units and invalid values, CPU rate warmup/reset, native counter layout, single in-flight reads, recovery after exceptions, nonblocking cleanup, stale readings, and rendering at 100%, 150%, and 200% scaling.
+
+Validation on 2026-11-01: warning-free build, 322 assertions passed, and normal/partial/stale/large-value previews inspected at the supported display scales. The live hardware probe returned all six readings as a normal user; after the initial counter setup, samples took about 6-10 ms. The installed widget was visible and responsive, recovered after hide/show and a simulated resume notification, and kept one instance after a second launch. The wireless mouse initially did not reply, then returned a valid battery reading. Actual suspend/resume, driver removal/reset, unplug/replug, USB/receiver failover, and moving between physical monitors were not tested. Bluetooth is unsupported.
+
+The compact layout was rebuilt with the same 322 passing assertions and inspected at 100%, 150%, and 200% scaling, including large values and unavailable readings. The installed window was responsive at 396 x 168 physical pixels on a 150% display, with live hardware readings updating. Its executable remains 34,816 bytes.
+
+A baseline sample before the compact layout change used a 34,816-byte executable. Over 75.32 seconds with the widget visible and updating, it used 0.516 CPU-seconds: about **0.057% of total CPU capacity** on 12 logical processors. Resident memory was about **66 MiB**, private memory 44 MiB, and GDI/USER object counts stayed constant during that sample. These are observations on one machine, not performance guarantees. Generated executables, previews, and diagnostic logs stay outside Git.
 
 ## Implementation
 
 WinForms handles the small UI; `setupapi.dll` and `hid.dll` provide device discovery and feature reports. Handles use zero desired access and shared mode, so the app does not claim mouse input. Only two power-query commands are allowed: class `0x07`, battery `0x80`, charging `0x84`. Replies are checked for status, transaction, command, length, and checksum. Requests use the Cobra transaction ID `0x1F` and wait 35 ms before reading; retries are bounded. Windows controls the duration of synchronous HID calls, which always run off the UI thread.
+
+Hardware uses Windows' [GetSystemTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getsystemtimes), [PDH counters](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcountervalue), and NVIDIA's existing [NVML device queries](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html). Counter paths are added with the English-counter API for localization support. Driver libraries load only from Windows System32. Hardware cleanup is deferred until the last background read completes, without waiting on the UI thread.
 
 Protocol facts were checked against OpenRazer's [mouse driver](https://github.com/openrazer/openrazer/blob/master/driver/razermouse_driver.c), [device IDs and timings](https://github.com/openrazer/openrazer/blob/master/driver/razermouse_driver.h), [power commands](https://github.com/openrazer/openrazer/blob/master/driver/razerchromacommon.c), and [report checksum](https://github.com/openrazer/openrazer/blob/master/driver/razercommon.c). This is an independent C# implementation; it does not bundle OpenRazer code or libraries.

@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
@@ -50,32 +51,40 @@ namespace RazerBattery
 
     internal sealed class BatteryWidget : Form
     {
-        private const int LogicalWidth = 204, LogicalHeight = 80;
+        private const int LogicalWidth = 264, LogicalHeight = 112;
         private readonly Func<BatteryReading> reader;
         private readonly string settingsPath;
         private readonly WidgetSettings settings;
         private readonly BatteryState state = new BatteryState();
         private readonly Timer timer = new Timer { Interval = 60000 };
+        private readonly Timer hardwareTimer = new Timer { Interval = 2000 };
+        private readonly HardwareReader hardwareReader;
+        private readonly HardwarePoller hardwarePoller;
         private readonly NotifyIcon tray = new NotifyIcon();
-        private readonly ToolTip tooltip = new ToolTip();
         private readonly ContextMenuStrip menu = new ContextMenuStrip();
         private readonly ToolStripMenuItem refresh = new ToolStripMenuItem("Refresh now");
         private readonly ToolStripMenuItem visibility = new ToolStripMenuItem("Hide widget");
         private readonly Font numberFont = new Font("Segoe UI", 25, FontStyle.Bold, GraphicsUnit.Pixel);
-        private readonly Font labelFont = new Font("Segoe UI", 11, FontStyle.Regular, GraphicsUnit.Pixel);
-        private readonly Font detailFont = new Font("Segoe UI", 10, FontStyle.Regular, GraphicsUnit.Pixel);
+        private readonly Font labelFont = new Font("Segoe UI", 13, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font metricFont = new Font("Segoe UI", 16, FontStyle.Regular, GraphicsUnit.Pixel);
         private Icon trayImage;
-        private bool polling, closing;
+        private bool polling, closing, shown, hardwareWasFresh;
+        private HardwareReading hardware = new HardwareReading();
+        private long hardwareSampledAt;
+        private int hardwareGeneration;
+        private string batteryDescription = "Cobra HyperSpeed | Checking mouse...";
         private float scale = 1;
         internal static readonly uint ShowMessage = RegisterWindowMessage("ScriptsAndUtils.RazerBattery.Show");
 
-        internal BatteryWidget(Func<BatteryReading> reader, string settingsPath)
+        internal BatteryWidget(Func<BatteryReading> reader, string settingsPath, HardwareReader hardwareReader = null)
         {
             this.reader = reader;
             this.settingsPath = settingsPath;
+            this.hardwareReader = hardwareReader;
+            if (hardwareReader != null) hardwarePoller = new HardwarePoller(hardwareReader.Read, hardwareReader.Dispose);
             settings = WidgetSettings.Load(settingsPath);
             Text = "Razer Battery";
-            AccessibleName = "Razer mouse battery";
+            AccessibleName = "Razer mouse battery and system monitor";
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -85,7 +94,7 @@ namespace RazerBattery
             TopMost = settings.TopMost;
             ClientSize = new Size(LogicalWidth, LogicalHeight);
             ContextMenuStrip = menu;
-            refresh.Click += delegate { RefreshReading(); };
+            refresh.Click += delegate { RefreshAll(); };
             var pin = new ToolStripMenuItem("Always on top") { Checked = TopMost, CheckOnClick = true };
             pin.CheckedChanged += delegate { TopMost = pin.Checked; SavePosition(); };
             visibility.Click += delegate { if (Visible) Hide(); else Reveal(); };
@@ -98,7 +107,17 @@ namespace RazerBattery
             tray.ContextMenuStrip = menu;
             tray.MouseClick += delegate(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Reveal(); };
             timer.Tick += delegate { RefreshReading(); };
-            UpdateTray("Cobra HyperSpeed | Checking mouse...");
+            hardwareTimer.Tick += delegate
+            {
+                if (hardwareWasFresh && !HardwareIsFresh)
+                {
+                    hardwareWasFresh = false;
+                    UpdateDescription();
+                    Invalidate();
+                }
+                RefreshHardware();
+            };
+            UpdateTray();
         }
 
         protected override CreateParams CreateParams
@@ -121,34 +140,87 @@ namespace RazerBattery
             Location = settings.Position ?? new Point(area.Right - Width - 20, area.Bottom - Height - 20);
             KeepOnScreen();
             tray.Visible = true;
+            shown = true;
             if (reader != null)
             {
                 timer.Start();
                 RefreshReading();
             }
+            if (hardwarePoller != null)
+            {
+                hardwareTimer.Start();
+                RefreshHardware();
+            }
+        }
+
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            if (!shown || closing || hardwarePoller == null) return;
+            hardwareGeneration++;
+            hardwareSampledAt = 0;
+            hardwareWasFresh = false;
+            UpdateDescription();
+            if (Visible) { hardwareTimer.Start(); RefreshHardware(); }
+            else hardwareTimer.Stop();
+        }
+
+        private void RefreshAll() { RefreshReading(); RefreshHardware(); }
+
+        private async void RefreshHardware()
+        {
+            if (closing || !Visible || hardwarePoller == null) return;
+            Task<HardwareReading> pending = hardwarePoller.Begin();
+            if (pending == null) return;
+            long started = Stopwatch.GetTimestamp();
+            int generation = hardwareGeneration;
+            HardwareReading reading;
+            try { reading = await pending; }
+            catch (Exception) { reading = new HardwareReading(); }
+            finally { hardwarePoller.Complete(pending); }
+            if (closing || IsDisposed || !Visible || generation != hardwareGeneration) return;
+            ApplyHardware(reading, started);
+        }
+
+        internal bool HardwareIsFresh
+        {
+            get { return hardwareSampledAt != 0 &&
+                (Stopwatch.GetTimestamp() - hardwareSampledAt) / (double)Stopwatch.Frequency <= 10; }
+        }
+
+        internal void ApplyHardware(HardwareReading reading, long sampledAt)
+        {
+            hardware = reading;
+            hardwareSampledAt = sampledAt;
+            hardwareWasFresh = HardwareIsFresh;
+            UpdateDescription();
+            Invalidate();
+        }
+
+        private void UpdateDescription()
+        {
+            AccessibleDescription = batteryDescription + "\n\n" +
+                (HardwareIsFresh ? hardware.Description : "Hardware readings pending or stale (over 10 seconds).");
         }
 
         private async void RefreshReading()
         {
             if (polling || closing || reader == null) return;
             polling = true;
-            refresh.Enabled = false;
             BatteryReading reading;
             try { reading = await Task.Run(reader); }
             catch (Exception) { reading = BatteryReading.Unavailable("Battery read failed"); }
             if (closing || IsDisposed) return;
             polling = false;
-            refresh.Enabled = true;
             ApplyReading(reading);
         }
 
         internal void ApplyReading(BatteryReading reading)
         {
             state.Apply(reading, DateTime.UtcNow);
-            string description = state.Tooltip(reading);
-            AccessibleDescription = description;
-            tooltip.SetToolTip(this, description + "\nDrag to move. Right-click for options.");
-            UpdateTray(description);
+            batteryDescription = state.Tooltip(reading);
+            UpdateDescription();
+            UpdateTray();
             Invalidate();
         }
 
@@ -170,25 +242,53 @@ namespace RazerBattery
             using (var outline = Rounded(new RectangleF(0.5f, 0.5f, LogicalWidth - 1, LogicalHeight - 1), 12))
                 g.DrawPath(border, outline);
             using (var pen = new Pen(Accent, 1.6f))
-            using (var mouse = Rounded(new RectangleF(18, 20, 24, 37), 11))
+            using (var mouse = Rounded(new RectangleF(15, 10, 18, 26), 8))
             {
                 g.DrawPath(pen, mouse);
-                g.DrawLine(pen, 30, 21, 30, 31);
-                g.DrawLine(pen, 19, 35, 41, 35);
-                g.DrawLine(pen, 30, 25, 30, 29);
+                g.DrawLine(pen, 24, 11, 24, 20);
+                g.DrawLine(pen, 16, 21, 32, 21);
             }
             using (var color = new SolidBrush(Accent))
             {
-                g.DrawString(state.Percent.HasValue ? state.Percent + "%" : "--", numberFont, color, 55, 8);
-                g.FillEllipse(color, 183, 19, 5, 5);
+                g.DrawString(state.Percent.HasValue ? state.Percent + "%" : "--", numberFont, color, 39, 4);
+                if (state.Charging == true)
+                    g.FillPolygon(color, new[] { new PointF(129, 13), new PointF(122, 24),
+                        new PointF(127, 24), new PointF(124, 33), new PointF(133, 21), new PointF(128, 21) });
             }
-            using (var label = new SolidBrush(Color.FromArgb(219, 224, 225)))
-                g.DrawString("Cobra HyperSpeed", labelFont, label, 57, 42);
-            using (var muted = new SolidBrush(Color.FromArgb(150, 161, 164)))
-                g.DrawString(state.Detail, detailFont, muted, 57, 58);
+            DrawHardware(g);
         }
 
-        private void UpdateTray(string description)
+        private void DrawHardware(Graphics g)
+        {
+            bool fresh = HardwareIsFresh;
+            using (var line = new Pen(Color.FromArgb(58, 64, 65)))
+                g.DrawLine(line, 14, 44, LogicalWidth - 14, 44);
+            using (var muted = new SolidBrush(Color.FromArgb(150, 161, 164)))
+            using (var value = new SolidBrush(Color.FromArgb(219, 224, 225)))
+            using (var cpu = new SolidBrush(Color.FromArgb(112, 184, 255)))
+            using (var gpu = new SolidBrush(Color.FromArgb(235, 139, 225)))
+            using (var right = new StringFormat { Alignment = StringAlignment.Far,
+                LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap })
+            {
+                g.DrawString("SYS", labelFont, muted, 153, 15);
+                g.DrawString(HardwareReading.Temperature(fresh ? hardware.SystemTemperature : null), metricFont, value,
+                    new RectangleF(194, 9, 58, 28), right);
+                g.DrawString("CPU", labelFont, cpu, 14, 53);
+                g.DrawString("GPU", labelFont, gpu, 14, 85);
+                g.DrawString(HardwareReading.Percent(fresh ? hardware.CpuLoad : null), metricFont, cpu,
+                    new RectangleF(47, 47, 50, 28), right);
+                g.DrawString(HardwareReading.Clock(fresh ? hardware.CpuMHz : null), metricFont, cpu,
+                    new RectangleF(101, 47, 91, 28), right);
+                g.DrawString(HardwareReading.Percent(fresh ? hardware.GpuLoad : null), metricFont, gpu,
+                    new RectangleF(47, 79, 50, 28), right);
+                g.DrawString(HardwareReading.Clock(fresh ? hardware.GpuMHz : null), metricFont, gpu,
+                    new RectangleF(101, 79, 91, 28), right);
+                g.DrawString(HardwareReading.Temperature(fresh ? hardware.GpuTemperature : null), metricFont, gpu,
+                    new RectangleF(194, 79, 58, 28), right);
+            }
+        }
+
+        private void UpdateTray()
         {
             using (var bitmap = new Bitmap(32, 32))
             using (Graphics g = Graphics.FromImage(bitmap))
@@ -207,8 +307,8 @@ namespace RazerBattery
                 if (trayImage != null) trayImage.Dispose();
                 trayImage = next;
             }
-            // .NET Framework limits NotifyIcon.Text to 63 characters.
-            tray.Text = description.Length > 63 ? description.Substring(0, 63) : description;
+            tray.Text = "Mouse battery: " + (state.Percent.HasValue ? state.Percent + "%" : "--") +
+                (state.Charging == true ? " (charging)" : state.Percent.HasValue && !state.IsLive ? " (last known)" : "");
         }
 
         internal void SetDpi(uint dpi)
@@ -261,13 +361,21 @@ namespace RazerBattery
             base.WndProc(ref m);
             if (m.Msg == 0x0232) { KeepOnScreen(); SavePosition(); } // WM_EXITSIZEMOVE
             if (m.Msg == 0x007E || m.Msg == 0x001A) KeepOnScreen(); // Display/work-area changes.
-            if (m.Msg == 0x0218 && (m.WParam.ToInt32() == 7 || m.WParam.ToInt32() == 18)) RefreshReading();
+            if (m.Msg == 0x0218 && (m.WParam.ToInt32() == 7 || m.WParam.ToInt32() == 18))
+            {
+                hardwareGeneration++;
+                hardwareSampledAt = 0;
+                if (hardwareReader != null) hardwareReader.RequestReset();
+                UpdateDescription();
+                Invalidate();
+                RefreshAll();
+            }
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (keyData == Keys.Escape) { Hide(); return true; }
-            if (keyData == (Keys.Control | Keys.R)) { RefreshReading(); return true; }
+            if (keyData == (Keys.Control | Keys.R)) { RefreshAll(); return true; }
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
@@ -275,6 +383,7 @@ namespace RazerBattery
         {
             closing = true;
             timer.Stop();
+            hardwareTimer.Stop();
             SavePosition();
             base.OnFormClosing(e);
         }
@@ -285,14 +394,15 @@ namespace RazerBattery
             {
                 closing = true;
                 timer.Dispose();
+                hardwareTimer.Dispose();
+                if (hardwarePoller != null) hardwarePoller.Dispose();
                 tray.Visible = false;
                 tray.Dispose();
                 if (trayImage != null) trayImage.Dispose();
-                tooltip.Dispose();
                 menu.Dispose();
                 numberFont.Dispose();
                 labelFont.Dispose();
-                detailFont.Dispose();
+                metricFont.Dispose();
             }
             base.Dispose(disposing);
         }

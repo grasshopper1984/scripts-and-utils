@@ -25,7 +25,7 @@ namespace RazerBattery
                     string settings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                         "RazerBatteryWidget", "settings.txt");
                     var reader = new BatteryReader();
-                    using (var widget = new BatteryWidget(reader.Read, settings)) Application.Run(widget);
+                    using (var widget = new BatteryWidget(reader.Read, settings, new HardwareReader())) Application.Run(widget);
                 }
                 finally { instance.ReleaseMutex(); }
             }
