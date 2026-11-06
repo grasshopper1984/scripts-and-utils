@@ -6,6 +6,7 @@
 #include <process.h>
 #include <atomic>
 #include "gesture.h"
+#include "resource.h"
 
 namespace {
 using namespace right_middle;
@@ -294,7 +295,10 @@ unsigned __stdcall InputMain(void*) {
 }
 
 void UpdateTray() {
-    tray.hIcon = LoadIconW(nullptr, failed.load() ? IDI_WARNING : enabled.load() ? IDI_APPLICATION : IDI_INFORMATION);
+    // Shared icon resources are cached by Windows; state changes do no drawing or allocation.
+    int icon = failed.load() ? IDI_RIGHT_MIDDLE_ERROR : enabled.load() ? IDI_RIGHT_MIDDLE : IDI_RIGHT_MIDDLE_PAUSED;
+    tray.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(icon), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
     const wchar_t* text = failed.load() ? L"Right Middle: paused after input error" :
         enabled.load() ? L"Right Middle: active (hold right 200 ms)" : L"Right Middle: paused";
     lstrcpynW(tray.szTip, text, ARRAYSIZE(tray.szTip));
@@ -376,6 +380,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int) {
     wc.lpfnWndProc = UiProc;
     wc.hInstance = instance;
     wc.lpszClassName = WindowClass;
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_RIGHT_MIDDLE));
     RegisterClassW(&wc);
     ui = CreateWindowExW(WS_EX_TOOLWINDOW, WindowClass, L"Right Middle", WS_OVERLAPPED,
         0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
@@ -386,7 +391,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int) {
     tray.uID = 1;
     tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray.uCallbackMessage = TrayMessage;
-    tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    tray.hIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_RIGHT_MIDDLE), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
     lstrcpynW(tray.szTip, L"Right Middle: starting", ARRAYSIZE(tray.szTip));
     Shell_NotifyIconW(NIM_ADD, &tray);
     if (!RegisterHotKey(ui, HotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10)) {

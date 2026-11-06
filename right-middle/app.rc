@@ -1,0 +1,4 @@
+#include "resource.h"
+IDI_RIGHT_MIDDLE ICON "app.ico"
+IDI_RIGHT_MIDDLE_PAUSED ICON "paused.ico"
+IDI_RIGHT_MIDDLE_ERROR ICON "error.ico"

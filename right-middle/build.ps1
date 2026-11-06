@@ -14,6 +14,7 @@ $kitVersion = Get-ChildItem -LiteralPath (Join-Path $kitRoot 'Include') -Directo
     Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1 -ExpandProperty Name
 if (-not $kitVersion) { throw 'A Windows 10/11 SDK was not found.' }
 $compiler = Join-Path $vc 'bin\Hostx64\x64\cl.exe'
+$resourceCompiler = Join-Path $kitRoot "bin\$kitVersion\x64\rc.exe"
 $previousInclude = $env:INCLUDE
 $previousLib = $env:LIB
 try {
@@ -25,9 +26,11 @@ try {
     New-Item -ItemType Directory -Force -Path $output | Out-Null
     $options = @('/nologo', '/std:c++17', '/O2', '/MT', '/EHsc', '/W4', '/WX', '/utf-8',
         '/DUNICODE', '/D_UNICODE', '/guard:cf')
+    & $resourceCompiler /nologo "/i$PSScriptRoot" "/fo$output\app.res" (Join-Path $PSScriptRoot 'app.rc')
+    if ($LASTEXITCODE -ne 0) { throw 'Icon resource build failed.' }
     & $compiler @options (Join-Path $PSScriptRoot 'main.cpp') "/Fo$output\main.obj" "/Fe$output\RightMiddle.exe" `
         /link /SUBSYSTEM:WINDOWS '/MANIFESTUAC:level=asInvoker uiAccess=false' /DYNAMICBASE /NXCOMPAT `
-        user32.lib shell32.lib wtsapi32.lib
+        "$output\app.res" user32.lib shell32.lib wtsapi32.lib
     if ($LASTEXITCODE -ne 0) { throw 'Build failed. Exit Right Middle before rebuilding.' }
     Write-Host ("Built RightMiddle.exe ({0:N0} bytes)" -f (Get-Item -LiteralPath (Join-Path $output 'RightMiddle.exe')).Length)
     if ($Test) {

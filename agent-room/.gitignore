@@ -1,0 +1,7 @@
+/bin/
+/test-output/
+/obj/
+*.db
+*.db-wal
+*.db-shm
+*.profile.json

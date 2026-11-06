@@ -13,7 +13,8 @@ $common = @('/nologo', '/optimize+', '/warn:4', '/warnaserror+', '/platform:anyc
     '/reference:System.Windows.Forms.dll', "/win32manifest:$PSScriptRoot\app.manifest")
 $sources = @('NativeHid.cs', 'Battery.cs', 'Hardware.cs', 'Widget.cs') | ForEach-Object { Join-Path $PSScriptRoot $_ }
 $exe = Join-Path $output 'RazerBattery.exe'
-& $compiler @common /target:winexe "/out:$exe" @sources (Join-Path $PSScriptRoot 'Program.cs')
+# The file icon identifies the app in Explorer and Startup; the tray keeps its live percentage.
+& $compiler @common /target:winexe "/out:$exe" "/win32icon:$PSScriptRoot\app.ico" @sources (Join-Path $PSScriptRoot 'Program.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Widget compilation failed. Exit the running widget before rebuilding.' }
 Write-Host ("Built RazerBattery.exe ({0:N0} bytes)" -f (Get-Item -LiteralPath $exe).Length)
 

@@ -6,7 +6,7 @@ A standalone native Windows mouse remapper. **Tap right = right click. Hold righ
 
 1. Exit the old AutoHotkey script before enabling this helper. Two remappers on the same button can interfere. Remove the old script or shortcut from Windows Startup when retiring it.
 2. Double-click `launch.cmd`, or run `bin/RightMiddle.exe` after building.
-3. **Ctrl+Alt+F10** pauses/resumes. Left- or right-click the tray icon for Pause/Resume and Exit. Windows may hide new tray icons in the overflow area. If that shortcut is unavailable, the helper exits before installing its hook.
+3. **Ctrl+Alt+F10** pauses/resumes. Left- or right-click the tray icon for Pause/Resume and Exit. The tray tile is teal while active, slate with pause bars while paused, and red with an exclamation mark after an input error. Windows may hide new tray icons in the overflow area. If that shortcut is unavailable, the helper exits before installing its hook.
 
 A short click is sent immediately on release, without waiting out the 200 ms hold threshold. Normal Windows context menus also open on release. Middle-button drag starts at the threshold. Right-button drag is intentionally replaced by middle-button drag. Existing Ctrl/Shift/Alt state is preserved.
 
