@@ -131,7 +131,8 @@ namespace AgentRoom
                         db.Execute("UPDATE agents SET last_seen=? WHERE id=?", now, actorId);
                         Interlocked.Increment(ref revision);
                     }
-                    return Json.Ok(Read(actor, operation, args, now));
+                    var read = Read(actor, operation, args, now);
+                    return isOperator ? Json.Ok(read) : Bounded(operation, read, args);
                 }
                 // Another caller may have committed this request while Git inspection ran.
                 var cached = Cached(actor, session, operation, requestId, digest);
@@ -183,7 +184,7 @@ namespace AgentRoom
             // A cursor reads forward, oldest first, so a listener can resume where it stopped.
             if (cmd == "feed" && args.ContainsKey("after")) return db.Query("SELECT * FROM messages WHERE id>? AND (visibility='published' OR author=? OR ?=1) ORDER BY id LIMIT ?", Json.Number(args, "after"), id, supervision ? 1 : 0, limit);
             if (cmd == "feed") return db.Query("SELECT * FROM messages WHERE id<? AND (visibility='published' OR author=? OR ?=1) AND (?=0 OR id IN (SELECT message_id FROM message_tasks WHERE task_id=?)) ORDER BY id DESC LIMIT ?", before, id, supervision ? 1 : 0, Json.Number(args, "task_id"), Json.Number(args, "task_id"), limit);
-            if (cmd == "inbox") return db.Query("SELECT m.*,CASE WHEN m.kind IN ('request','question') THEN 1 ELSE 0 END AS needs_reply FROM messages m JOIN receipts r ON r.message_id=m.id WHERE r.recipient=? AND r.acknowledged IS NULL ORDER BY m.id LIMIT ?", id, limit);
+            if (cmd == "inbox") return db.Query("SELECT m.*,CASE WHEN m.kind IN ('request','question') THEN 1 ELSE 0 END AS needs_reply FROM messages m JOIN receipts r ON r.message_id=m.id WHERE r.recipient=? AND r.acknowledged IS NULL AND m.id>? ORDER BY m.id LIMIT ?", id, Json.Number(args, "after"), limit);
             if (cmd == "tasks")
             {
                 var values = new List<object>();
@@ -419,6 +420,7 @@ namespace AgentRoom
             Require(actor, "op", "moderator", "coordinator", "worker");
             string id = (string)actor["id"];
             string body = Json.Required(a, "body");
+            if (body.Length > MaxBodyChars) throw new RoomError("invalid_argument", "A message body is limited to " + MaxBodyChars + " characters. Put long material in an artifact or a ticket checkpoint and cite it.");
             string kind = Json.Text(a, "kind", "note", 20);
             if (!MessageKinds.Contains(kind)) throw new RoomError("invalid_argument", "Unknown message kind. Use note, request, question, result, or answer.");
             var original = ReplyTarget(actor, kind, a);

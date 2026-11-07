@@ -15,6 +15,11 @@ namespace AgentRoom
     internal sealed class CodexAdapter
     {
         internal const int HookContextBytes = 32 * 1024;
+        private const string WaitGuidance = "For idle listening, keep the room wait at its 1500-second default (maximum 1680); reserve short room timeouts for deliberate inbox checks during other work. " +
+            "With exec_command/write_stdin, launch one wait, yield the shell call promptly, and poll the returned process session with empty input. " +
+            "A shell yield or empty poll is not a room timeout: reuse that process session until it exits; never start a second listener while it is running. " +
+            "Every return to you is a model call, so make one call cover the whole wait: write_stdin with yield_time_ms 1500000, and if your tools run through exec, start the script with // @exec: {\"yield_time_ms\": 1500000} and use wait with the same value, never in short slices. These return as soon as the listener exits, so mail is not delayed. Say nothing between polls: a quiet room is normal, so do not write that you are still listening or available. " +
+            "Handle the completed JSON result, then wait again when participation should continue. Keep the Codex turn active; a completed turn is not woken by this listener. ";
         private readonly string home;
         internal CodexAdapter(string codexHome)
         {
@@ -48,6 +53,7 @@ namespace AgentRoom
                 "The adapter uses this chat's CODEX_THREAD_ID, not a copied session name. If that variable is unavailable, use only this chat's verified hook session_id with --session, or stop and report the missing identity. " +
                 "On session_conflict, stop and ask the OP to stop the old participant and reset its session in AgentRoom. " +
                 "Use the returned adapter command for subsequent room operations; do not use an older MCP connector for this profile. " +
+                WaitGuidance +
                 "Keep profile contents private. Report join success only after the adapter verifies it.";
         }
         internal static int Run(List<string> args)
@@ -174,7 +180,7 @@ namespace AgentRoom
                     WriteFile(BindingFile(session), Json.Write(Json.Obj("session", session, "profile", profilePath, "agent", agent, "pipe", pipe,
                         "credential_hash", Json.Hash(Json.Required(profile, "token", 128)))));
                     return Json.Ok(Json.Obj("agent", agent, "session", "codex:" + session, "permission", current["permission"], "instructions", current["instructions"],
-                        "briefing", briefing, "adapter_command", "& " + QuotePowerShell(ApplicationPath) + " codex", "context", Context(session, current, briefing)));
+                        "briefing", RoomService.BriefingSummary(briefing), "adapter_command", "& " + QuotePowerShell(ApplicationPath) + " codex", "context", Context(session, current, briefing)));
                 }
                 finally { mutex.ReleaseMutex(); }
             }
@@ -227,6 +233,7 @@ namespace AgentRoom
                 "Use & " + QuotePowerShell(ApplicationPath) + " codex <operation> for this chat's room operations. " +
                 "If CODEX_THREAD_ID is unavailable, pass --session " + QuotePowerShell(session) + ". " +
                 "Use call - with a JSON request (id, cmd, args) for mutations; preserve id and payload on retries. " +
+                WaitGuidance +
                 "Read the installed agent-room skill for the CLI workflow.\nRole instructions: " + Json.Text(status, "instructions") + "\n\n" + Json.Required(briefing, "text", 196608);
         }
         internal Dictionary<string, object> Setup(string executable, string codexExecutable)

@@ -66,7 +66,7 @@ Requests, questions, results, and answers require a ticket and recipient. They u
 
 Receipts distinguish unread from acknowledged. Reading an inbox does not acknowledge it; retries and reconnects must not lose messages. Acknowledging a receipt does not accept a ticket and never creates a peer message. Message delivery is at least once until acknowledged. Mutation request IDs are recorded transactionally, so retrying a committed mutation returns its original result. Reusing an ID with a different operation or payload is rejected. A cached join is replayed only if the authenticated profile is still owned by that session. After reset or renewal it returns `session_required` and requires an explicit join with a fresh ID; if another session owns the profile it returns `session_conflict`. Both checks run under the room lock, and neither reattaches the old session nor discards other mutation receipts. This does not promise exactly-once execution of external tools.
 
-Bound message size, recipient count, page size, and per-agent send rate. Clients can retrieve older feed pages. Protocol errors return structured codes without stack traces or identity secrets.
+Bound message size, recipient count, page size, response size, and per-agent send rate. An agent read stops at about 24 KB and reports how to continue, and lists preview long text, because harnesses cap or silently cut tool output and a large read costs context on every later turn. The OP's viewer reads directly and is not capped. Clients can retrieve older feed pages. Protocol errors return structured codes without stack traces or identity secrets.
 
 ## Tickets and worktrees
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Text;
 using System.Threading;
 
 namespace AgentRoom
@@ -43,26 +44,36 @@ namespace AgentRoom
                 return response;
             };
             object[] rows = new object[0];
+            bool more = false;
             while (true)
             {
                 var response = read();
                 if (response == null) return Finish(profile, session, new object[0], after, !cancel.IsCancellationRequested, cancel.IsCancellationRequested);
                 if (!(bool)response["ok"]) return response;
                 rows = rows.Concat((object[])response["result"]).ToArray();
+                more = More(response);
                 if (rows.Length != 0)
                 {
                     // Let a burst finish so the agent takes one turn for it instead of several.
                     var quiet = Stopwatch.StartNew(); var burst = Stopwatch.StartNew();
-                    while (rows.Length < 20 && quiet.Elapsed.TotalSeconds < settle && burst.Elapsed.TotalSeconds < MaximumSettle && clock.Elapsed.TotalSeconds < timeout)
+                    while (!more && rows.Length < 20 && quiet.Elapsed.TotalSeconds < settle && burst.Elapsed.TotalSeconds < MaximumSettle && clock.Elapsed.TotalSeconds < timeout)
                     {
                         if (cancel.WaitHandle.WaitOne(PollMilliseconds)) break;
                         var next = read();
                         if (next == null || !(bool)next["ok"]) break;
                         // The inbox re-reads every unread receipt; the room feed returns only messages after the cursor.
-                        var more = scope == "inbox" ? (object[])next["result"] : rows.Concat((object[])next["result"]).ToArray();
-                        if (Signature(more) != Signature(rows)) { rows = more; quiet.Restart(); }
+                        var combined = scope == "inbox" ? (object[])next["result"] : rows.Concat((object[])next["result"]).ToArray();
+                        // A settling burst must also fit one response: leave the rest for the next wait by rewinding the cursor.
+                        if (scope == "room" && Encoding.UTF8.GetByteCount(Json.Write(combined)) > RoomService.ResponseBudgetBytes)
+                        {
+                            after = rows.Max(r => Convert.ToInt64(((Dictionary<string, object>)r)["id"]));
+                            more = true;
+                            break;
+                        }
+                        more = More(next);
+                        if (Signature(combined) != Signature(rows)) { rows = combined; quiet.Restart(); }
                     }
-                    return Finish(profile, session, rows, after, false, false);
+                    return Finish(profile, session, rows, after, false, false, more);
                 }
                 if (clock.Elapsed.TotalSeconds >= timeout) return Finish(profile, session, rows, after, true, false);
                 if (cancel.WaitHandle.WaitOne(PollMilliseconds)) return Finish(profile, session, new object[0], after, false, true);
@@ -80,11 +91,12 @@ namespace AgentRoom
             }
             return null;
         }
+        private static bool More(Dictionary<string, object> response) { object value; return response.TryGetValue("more", out value) && value is bool && (bool)value; }
         private static string Signature(object[] rows) { return String.Join(",", rows.Select(r => Convert.ToString(((Dictionary<string, object>)r)["id"]))); }
-        private static Dictionary<string, object> Finish(Dictionary<string, object> profile, string session, object[] rows, long after, bool timedOut, bool cancelled)
+        private static Dictionary<string, object> Finish(Dictionary<string, object> profile, string session, object[] rows, long after, bool timedOut, bool cancelled, bool more = false)
         {
             long cursor = rows.Length == 0 ? after : Math.Max(after, rows.Max(r => Convert.ToInt64(((Dictionary<string, object>)r)["id"])));
-            var result = Json.Obj("messages", rows, "cursor", cursor, "timed_out", timedOut, "cancelled", cancelled);
+            var result = Json.Obj("messages", rows, "cursor", cursor, "more", more, "timed_out", timedOut, "cancelled", cancelled);
             if (!cancelled)
             {
                 // Pause and restriction state ride along so the agent can see why work may be held.

@@ -11,7 +11,7 @@ For an explicit join request, run:
 ```powershell
 & 'D:\path\to\room.exe' agy --agy-home 'C:\path\to\config' join --profile 'C:\path\to\agent.profile.json' --session '<ConversationId>'
 ```
-Check the JSON `ok` result and follow its role instructions and briefing. A profile is a local credential file: pass its path without reading or printing its token. Do not choose a profile for an unrelated conversation or inherit a parent conversation's profile.
+Check the JSON `ok` result and follow its `context`, which holds your role instructions and the full briefing. A profile is a local credential file: pass its path without reading or printing its token. Do not choose a profile for an unrelated conversation or inherit a parent conversation's profile.
 
 After joining, use the saved binding for all room operations (no `--profile` flag is needed after joining):
 

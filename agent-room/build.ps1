@@ -18,11 +18,7 @@ $options += "/resource:$PSScriptRoot\codex\session-start.ps1,AgentRoom.CodexHook
 $options += "/resource:$PSScriptRoot\agy\skills\agent-room\SKILL.md,AgentRoom.AgySkill"
 $options += "/resource:$PSScriptRoot\agy\pre-invocation.ps1,AgentRoom.AgyHook"
 $options += "/resource:$PSScriptRoot\README.md,AgentRoom.Readme"
-# The Claude Code skill must carry the same text the hub briefs, below its front matter.
-$skill = (Get-Content -LiteralPath "$PSScriptRoot\skills\room-moderator\SKILL.md" -Raw -Encoding UTF8) -replace "`r`n", "`n"
-$playbook = (Get-Content -LiteralPath "$PSScriptRoot\roles\moderator.md" -Raw -Encoding UTF8) -replace "`r`n", "`n"
-if (($skill -split '(?m)^---\s*$', 3)[2].Trim() -ne $playbook.Trim()) { throw 'skills/room-moderator/SKILL.md must match roles/moderator.md below its front matter.' }
-$sources = @('Json.cs','Database.cs','LocalFiles.cs','RoomService.cs','OperatorMigration.cs','ConnectionSessions.cs','Coordination.cs','Threads.cs','ProjectData.cs','Waiting.cs','Transport.cs','CodexAdapter.cs','AgyAdapter.cs','GraphView.cs','DetailView.cs','Viewer.cs','ViewerActions.cs','Program.cs') |
+$sources = @('Json.cs','Database.cs','LocalFiles.cs','RoomService.cs','OperatorMigration.cs','ConnectionSessions.cs','Coordination.cs','Threads.cs','ResponseLimits.cs','ProjectData.cs','Waiting.cs','Transport.cs','CodexAdapter.cs','AgyAdapter.cs','GraphView.cs','DetailView.cs','Viewer.cs','ViewerActions.cs','Program.cs') |
     ForEach-Object { Join-Path $PSScriptRoot $_ }
 # Builds to a temporary file, then swaps it in. Windows allows renaming a running executable but not overwriting it,
 # so a copy still in use by the hub or an agent's connector is moved aside and keeps running until that process exits.

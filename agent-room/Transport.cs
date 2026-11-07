@@ -71,7 +71,7 @@ namespace AgentRoom
                     Dictionary<string, object> response;
                     try { response = service.Handle(Json.Read(request)); }
                     catch (RoomError e) { response = Json.Error(e.Code, e.Message); }
-                    await Wire.WriteAsync(pipe, Json.Write(response)).ConfigureAwait(false);
+                    await Wire.WriteAsync(pipe, Wire.ResponseText(response)).ConfigureAwait(false);
                 }
                 catch (IOException) { }
                 catch (ObjectDisposedException) { }
@@ -124,6 +124,15 @@ namespace AgentRoom
             await stream.WriteAsync(header, 0, header.Length).ConfigureAwait(false);
             await stream.WriteAsync(body, 0, body.Length).ConfigureAwait(false);
             await stream.FlushAsync().ConfigureAwait(false);
+        }
+        // An oversized response gets a clear error instead of a dropped connection the client would retry forever.
+        internal static string ResponseText(Dictionary<string, object> response)
+        {
+            string text = null;
+            try { text = Json.Write(response); }
+            catch (InvalidOperationException) { }
+            if (text != null && Encoding.UTF8.GetByteCount(text) <= 2097152) return text;
+            return Json.Write(Json.Error("response_too_large", "That response exceeds the transport limit. Request a smaller page or a single record."));
         }
         internal static Dictionary<string, object> Call(Dictionary<string, object> profile, string session, string cmd,
             Dictionary<string, object> args, string requestId)

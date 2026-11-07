@@ -26,9 +26,9 @@ namespace AgentRoom
                 output = Path.GetFullPath(args[0]); Directory.CreateDirectory(output);
                 Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
                 if (args.Length > 1 && args[1] == "--preview") { Preview(true); return 0; }
-                DatabaseTests(); IdentityAndDelivery(); TaskTests(); ModerationTests(); ProjectTests(); MigrationTests(); NamingTests(); ReliabilityTests(); ConnectionSessionTests(); ReviewFixTests(); CoordinationTests(); BriefingTests(); ThreadTests(); CodexTests(); AgyTests(); ViewTests();
+                DatabaseTests(); IdentityAndDelivery(); TaskTests(); ModerationTests(); ProjectTests(); MigrationTests(); NamingTests(); ReliabilityTests(); ConnectionSessionTests(); ReviewFixTests(); CoordinationTests(); BriefingTests(); BriefingContractTests(); ResponseLimitTests(); ThreadTests(); CodexTests(); AgyTests(); ViewTests();
                 Console.WriteLine("Storage, identity, DAG, migration, and moderation passed: " + assertions + " assertions.");
-                TransportTests(); ProcessTests(); WorktreeTests(); Preview(); ConnectorTests();
+                TransportTests(); ProcessTests(); WaitLimitTests(); WorktreeTests(); Preview(); ConnectorTests();
                 Console.WriteLine("PASS: " + assertions + " assertions. Artifacts: " + output);
                 return 0;
             }
@@ -393,6 +393,63 @@ namespace AgentRoom
                     }
                 }
                 finally { if (!previous.HasExited) { previous.Kill(); previous.WaitForExit(); } }
+            }
+        }
+        // A burst larger than one response must arrive over several waits, each within budget, with nothing skipped.
+        private static void WaitLimitTests()
+        {
+            string directory = Folder("wait-limits");
+            Func<string, string> arguments = agent => "--profile " + Quote(Path.Combine(directory, agent + ".profile.json")) + " --session " + agent + "-test ";
+            using (var service = new RoomService(directory))
+                foreach (var agent in new[] { new[] { "lead", "coordinator" }, new[] { "mod", "moderator" }, new[] { "bee", "worker" } })
+                    File.WriteAllText(Path.Combine(directory, agent[0] + ".profile.json"), Json.Write(Result(service.Admin("agent.enroll", Json.Obj("agent", agent[0], "permission", agent[1])))), new UTF8Encoding(false));
+            using (var hub = Child("--serve --data " + Quote(directory)))
+            {
+                try
+                {
+                    Check(Json.Read(hub.StandardOutput.ReadLine()).ContainsKey("ready"), "The wait-limit hub is serving");
+                    foreach (string agent in new[] { "lead", "mod", "bee" }) Result(Json.Read(RunChild(arguments(agent) + "join", null)));
+                    Func<string, Dictionary<string, object>, Dictionary<string, object>> wait = (agent, args) =>
+                    {
+                        string text = RunChild(arguments(agent) + "call -", Json.Write(Json.Obj("cmd", "wait", "args", args)));
+                        Check(Encoding.UTF8.GetByteCount(text) <= RoomService.ResponseBudgetBytes + 512, "A wait over the pipe stays within the response budget");
+                        return Result(Json.Read(text));
+                    };
+                    // Start listening first, so the burst arrives during the settle window.
+                    using (var listener = Child(arguments("mod") + "call -"))
+                    {
+                        var heard = listener.StandardOutput.ReadToEndAsync();
+                        listener.StandardInput.Write(Json.Write(Json.Obj("cmd", "wait", "args", Json.Obj("scope", "room", "after", 0, "timeout_seconds", 60, "settle_seconds", 3)))); listener.StandardInput.Close();
+                        var sent = new List<long>();
+                        string body = new string('x', RoomService.MaxBodyChars);
+                        for (int i = 0; i < 14; i++)
+                            sent.Add(Convert.ToInt64(Result(Json.Read(RunChild(arguments("lead") + "call -", Json.Write(Json.Obj("id", "burst-" + i, "cmd", "post", "args", Json.Obj("body", body, "to", new[] { "bee" }))))))["message_id"]));
+                        Check(listener.WaitForExit(60000), "The first wait returns during the burst");
+                        Check(Encoding.UTF8.GetByteCount(heard.Result) <= RoomService.ResponseBudgetBytes + 512, "The first wait stays within the response budget");
+                        var room = Result(Json.Read(heard.Result));
+                        var received = ((object[])room["messages"]).Select(r => Convert.ToInt64(((Dictionary<string, object>)r)["id"])).ToList();
+                        for (int round = 0; round < 10 && received.Count < sent.Count; round++)
+                        {
+                            room = wait("mod", Json.Obj("scope", "room", "after", room["cursor"], "timeout_seconds", 5, "settle_seconds", 0));
+                            received.AddRange(((object[])room["messages"]).Select(r => Convert.ToInt64(((Dictionary<string, object>)r)["id"])));
+                        }
+                        Check(received.SequenceEqual(sent), "Room waits return a large burst completely, once each, in order");
+                        var unread = new List<long>(); bool sawMore = false;
+                        for (int round = 0; round < 10 && unread.Count < sent.Count; round++)
+                        {
+                            var inbox = wait("bee", Json.Obj("timeout_seconds", 5, "settle_seconds", 0));
+                            sawMore = sawMore || (bool)inbox["more"];
+                            foreach (Dictionary<string, object> row in (object[])inbox["messages"])
+                            {
+                                unread.Add(Convert.ToInt64(row["id"]));
+                                Check((bool)row["body_truncated"], "A long inbox message arrives as a preview");
+                                Result(Json.Read(RunChild(arguments("bee") + "call -", Json.Write(Json.Obj("id", "ack-" + row["id"], "cmd", "ack", "args", Json.Obj("message_id", row["id"]))))));
+                            }
+                        }
+                        Check(sawMore && unread.SequenceEqual(sent), "An inbox wait reports more and delivers the rest after acknowledgment");
+                    }
+                }
+                finally { hub.StandardInput.Close(); if (!hub.WaitForExit(10000)) hub.Kill(); }
             }
         }
         private static void Git(string directory, string args)

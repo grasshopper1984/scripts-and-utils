@@ -184,7 +184,7 @@ namespace AgentRoom
                         "credential_hash", Json.Hash(Json.Required(profile, "token", 128)))));
                     string command = Command(session);
                     return Json.Ok(Json.Obj("agent", agent, "session", "agy:" + session, "permission", current["permission"], "instructions", current["instructions"],
-                        "briefing", briefing, "adapter_command", command, "context", Context(session, current, briefing)));
+                        "briefing", RoomService.BriefingSummary(briefing), "adapter_command", command, "context", Context(session, current, briefing)));
                 }
                 finally { mutex.ReleaseMutex(); }
             }

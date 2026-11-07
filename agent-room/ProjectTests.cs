@@ -176,6 +176,146 @@ namespace AgentRoom
                 Check(Convert.ToInt64(node["messages"]) == 3 && Convert.ToInt64(node["open_asks"]) == 1, "Graph nodes carry only their thread's counts");
             }
         }
+        private static int ResponseBytes(object response) { return System.Text.Encoding.UTF8.GetByteCount(Json.Write(response)); }
+        private static void ResponseLimitTests()
+        {
+            foreach (string unit in new[] { "x", "界", "<" })
+                using (var f = new Fixture("limits"))
+                {
+                    string label = " (" + (unit == "x" ? "plain" : unit == "<" ? "escaped" : "multibyte") + " text)", body = String.Concat(Enumerable.Repeat(unit, RoomService.MaxBodyChars));
+                    long ticket = Convert.ToInt64(f.Ticket("Limits", "alice")["id"]);
+                    Error(f.Call("coordinator", "post", Json.Obj("body", body + unit, "to", new[] { "alice" }, "task_id", ticket)), "invalid_argument");
+                    var ids = new List<long>();
+                    for (int i = 0; i < 30; i++)
+                    {
+                        f.Now += 4;
+                        ids.Add(Convert.ToInt64(Result(f.Call("coordinator", "post", Json.Obj("body", body, "to", new[] { "alice" }, "task_id", ticket)))["message_id"]));
+                    }
+
+                    // Every list read stays within budget and pages through all rows without gaps or repeats.
+                    var seen = new List<long>(); var args = Json.Obj();
+                    for (int page = 0; page < 40; page++)
+                    {
+                        var response = f.Call("alice", "inbox", new Dictionary<string, object>(args));
+                        Check(ResponseBytes(response) <= RoomService.ResponseBudgetBytes, "An inbox page stays within the budget" + label);
+                        var rows = Rows(response);
+                        Check(rows.Count != 0 && rows.All(r => (bool)r["body_truncated"] && Convert.ToInt64(r["body_length"]) == RoomService.MaxBodyChars && ((string)r["body"]).Length == RoomService.PreviewChars), "Long bodies are previewed and report their length" + label);
+                        seen.AddRange(rows.Select(r => Convert.ToInt64(r["id"])));
+                        if (!response.ContainsKey("more")) break;
+                        args = Json.Obj("after", ((Dictionary<string, object>)response["next"])["after"]);
+                    }
+                    Check(seen.SequenceEqual(ids), "Inbox paging returns every unread message once, in order" + label);
+                    seen.Clear(); args = Json.Obj();
+                    for (int page = 0; page < 40; page++)
+                    {
+                        var response = f.Call("alice", "feed", new Dictionary<string, object>(args));
+                        Check(ResponseBytes(response) <= RoomService.ResponseBudgetBytes, "A feed page stays within the budget" + label);
+                        seen.AddRange(Rows(response).Select(r => Convert.ToInt64(r["id"])));
+                        if (!response.ContainsKey("more")) break;
+                        args = Json.Obj("before", ((Dictionary<string, object>)response["next"])["before"]);
+                    }
+                    Check(seen.SequenceEqual(ids.AsEnumerable().Reverse()), "Feed paging walks back through every message" + label);
+                    seen.Clear(); args = Json.Obj("after", ids[0] - 1);
+                    for (int page = 0; page < 40; page++)
+                    {
+                        var response = f.Call("moderator", "feed", new Dictionary<string, object>(args));
+                        Check(ResponseBytes(response) <= RoomService.ResponseBudgetBytes, "A forward feed page stays within the budget" + label);
+                        seen.AddRange(Rows(response).Select(r => Convert.ToInt64(r["id"])));
+                        if (!response.ContainsKey("more")) break;
+                        args = Json.Obj("after", ((Dictionary<string, object>)response["next"])["after"]);
+                    }
+                    Check(seen.SequenceEqual(ids), "A feed cursor reads forward with no gaps" + label);
+                    seen.Clear(); args = Json.Obj("task_id", ticket);
+                    for (int page = 0; page < 40; page++)
+                    {
+                        var response = f.Call("alice", "thread", new Dictionary<string, object>(args));
+                        Check(ResponseBytes(response) <= RoomService.ResponseBudgetBytes, "A thread page stays within the budget" + label);
+                        var rows = DataRows(((Dictionary<string, object>)response["result"])["messages"]).Select(r => Convert.ToInt64(r["id"])).ToList();
+                        Check(rows.SequenceEqual(rows.OrderBy(id => id)), "A thread page reads oldest first" + label);
+                        seen.InsertRange(0, rows);
+                        if (!response.ContainsKey("more")) break;
+                        args = Json.Obj("task_id", ticket, "before", ((Dictionary<string, object>)response["next"])["before"]);
+                    }
+                    Check(seen.SequenceEqual(ids), "Thread paging reaches the first message" + label);
+                    Check(ResponseBytes(f.Call("alice", "task", Json.Obj("task_id", ticket))) <= RoomService.ResponseBudgetBytes, "A ticket's recent messages fit the budget" + label);
+
+                    // The full text stays one read away, and the OP's viewer is not capped.
+                    Check((string)Result(f.Call("alice", "message", Json.Obj("message_id", ids[0])))["body"] == body, "message returns the whole body" + label);
+                    Check(((string)Rows(f.Room.Admin("feed"))[0]["body"]) == body && !f.Room.Admin("feed").ContainsKey("more"), "The OP's viewer reads uncapped" + label);
+                    Result(f.Call("alice", "task.claim", Json.Obj("task_id", ticket, "version", 1)));
+                    string longField = String.Concat(Enumerable.Repeat(unit, 8000));
+                    for (int i = 0; i < 12; i++) f.Ticket("Long " + i);
+                    Result(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 2, "state", "active", "checkpoint", longField)));
+                    var tasks = f.Call("alice", "tasks");
+                    Check(ResponseBytes(tasks) <= RoomService.ResponseBudgetBytes, "A tasks page stays within the budget" + label);
+                    var listed = Result(f.Call("alice", "task", Json.Obj("task_id", ticket)));
+                    Check((string)listed["checkpoint"] == longField, "task returns its fields whole" + label);
+                    Check(ResponseBytes(Json.Ok(listed)) <= RoomService.ResponseBudgetBytes || (DataRows(listed["messages"]).Count == 0 && (bool)listed["messages_more"]), "A ticket with long fields gives up its messages and says so" + label);
+                    Check(Rows(f.Call("alice", "tasks", Json.Obj("agent", "alice"))).All(r => ((string)r["checkpoint"]).Length <= RoomService.PreviewChars), "tasks previews long fields" + label);
+                }
+            string oversized = Wire.ResponseText(Json.Ok(new string('<', 500000)));
+            Check((string)((Dictionary<string, object>)Json.Read(oversized)["error"])["code"] == "response_too_large", "A response past the transport limit becomes a clear error");
+            Check((bool)Json.Read(Wire.ResponseText(Json.Ok("small")))["ok"], "Normal responses pass through unchanged");
+            var summary = RoomService.BriefingSummary(Json.Obj("role", "worker", "version", "abc", "source", "built-in", "text", "long"));
+            Check(summary.ContainsKey("version") && !summary.ContainsKey("text"), "A join's briefing summary does not repeat the text");
+        }
+        // Holds the briefing to what the hub does, and to a size agents can afford on every model call.
+        private static void BriefingContractTests()
+        {
+            string protocol = RoomService.BuiltInDocument("protocol.md");
+            Check(protocol.Length + RoomService.BuiltInDocument("moderator.md").Length <= 12000, "The largest briefing stays small enough to inject before each model call");
+            foreach (string word in new[] { "request_id", "stale_version", "visibility", "open_asks", "task.update" })
+                Check(protocol.Contains(word), "The protocol documents " + word);
+            foreach (string word in new[] { "`moderate`", "`budget.reset`", "`escalate`", "`unmute`", "latest_message" })
+                Check(RoomService.BuiltInDocument("moderator.md").Contains(word), "The moderator playbook documents " + word);
+            foreach (string word in new[] { "`task.claim`", "`task.update`", "`heartbeat`", "`inbox`", "`review`" })
+                Check(RoomService.BuiltInDocument("worker.md").Contains(word), "The worker playbook documents " + word);
+            foreach (string word in new[] { "`task.create`", "`task.assign`", "`task.undepend`", "`heartbeat`", "`inbox`" })
+                Check(RoomService.BuiltInDocument("coordinator.md").Contains(word), "The coordinator playbook documents " + word);
+            using (var f = new Fixture("contract"))
+            {
+                long ticket = Convert.ToInt64(f.Ticket("Contract", "alice")["id"]);
+                Func<long> openAsks = () => Convert.ToInt64(Rows(f.Call("moderator", "threads")).Single(r => Convert.ToInt64(r["task_id"]) == ticket)["open_asks"]);
+                long request = Convert.ToInt64(Result(f.Call("coordinator", "post", Json.Obj("kind", "request", "task_id", ticket, "to", new[] { "alice" }, "body", "Build it")))["message_id"]);
+                Result(f.Call("alice", "task.claim", Json.Obj("task_id", ticket, "version", 1)));
+                foreach (string status in new[] { "available", "working", "paused", "quota exhausted", "disconnected" })
+                    Result(f.Call("alice", "heartbeat", Json.Obj("status", status)));
+
+                // Progress goes in a checkpoint, which replaces the last one and wakes nobody.
+                Result(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 2, "state", "active", "checkpoint", "First milestone")));
+                Result(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 3, "state", "active", "checkpoint", "Second milestone")));
+                Check((string)Result(f.Call("coordinator", "task", Json.Obj("task_id", ticket)))["checkpoint"] == "Second milestone", "Each checkpoint replaces the last");
+                Check(Rows(f.Call("coordinator", "inbox")).Count == 0 && Rows(f.Call("moderator", "feed", Json.Obj("after", request))).Count == 0, "A checkpoint creates no message or receipt");
+
+                // A follow-up on a ticket in review reactivates it; it cannot be claimed again.
+                Result(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 4, "state", "review", "checkpoint", "Ready")));
+                Error(f.Call("alice", "task.claim", Json.Obj("task_id", ticket, "version", 5)), "conflict");
+                Result(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 5, "state", "active", "checkpoint", "Follow-up started")));
+                Error(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 5, "state", "active", "checkpoint", "Stale")), "stale_version");
+
+                // While the room is paused, checkpoints use paused rather than active.
+                Result(f.Room.Admin("moderate", Json.Obj("action", "pause", "reason", "Check the documented rule")));
+                Error(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 6, "state", "active", "checkpoint", "Rejected")), "paused");
+                Result(f.Call("alice", "task.update", Json.Obj("task_id", ticket, "version", 6, "state", "paused", "checkpoint", "Safe checkpoint")));
+                var held = Result(f.Call("alice", "post", Json.Obj("kind", "question", "task_id", ticket, "to", new[] { "coordinator" }, "body", "Held question")));
+                Check((string)held["visibility"] == "held" && Rows(f.Call("coordinator", "inbox")).Count == 0, "A held post reports its visibility and reaches nobody");
+                Result(f.Room.Admin("moderate", Json.Obj("action", "resume", "reason", "Done checking")));
+
+                // The moderator's documented commands use these arguments, and unmute lifts a throttle.
+                Result(f.Call("moderator", "moderate", Json.Obj("action", "throttle", "target", "bob", "seconds", 30, "reason", "Documented form", "evidence", new[] { request.ToString() })));
+                Check(Rows(f.Call("moderator", "members")).Single(r => (string)r["id"] == "bob")["restriction"] != null, "A throttle takes effect");
+                Result(f.Call("moderator", "moderate", Json.Obj("action", "unmute", "target", "bob", "reason", "Lift it")));
+                Check(Rows(f.Call("moderator", "members")).Single(r => (string)r["id"] == "bob")["restriction"] == null, "Unmute also lifts a throttle");
+                Check(Convert.ToInt64(Result(f.Call("moderator", "status"))["latest_message"]) > 0, "Status gives the moderator its first cursor");
+
+                // Closing a ticket settles its asks, so old requests stop showing as awaiting a reply.
+                Check(openAsks() == 1, "An unanswered request is open while its ticket is open");
+                long version = Convert.ToInt64(Result(f.Call("coordinator", "task", Json.Obj("task_id", ticket)))["version"]);
+                Result(f.Call("coordinator", "task.update", Json.Obj("task_id", ticket, "version", version, "state", "done", "checkpoint", "Closed")));
+                Check(openAsks() == 0 && DataRows(Result(f.Call("moderator", "thread", Json.Obj("task_id", ticket)))["messages"]).All(m => Convert.ToInt64(m["open_ask"]) == 0), "Asks on a closed ticket are no longer open");
+                Check(Convert.ToInt64(DataRows(Result(f.Call("moderator", "graph"))["nodes"]).Single(n => Convert.ToInt64(n["id"]) == ticket)["open_asks"]) == 0, "Closed tickets show no asks on the graph");
+            }
+        }
         private static void BriefingTests()
         {
             using (var f = new Fixture("briefing"))

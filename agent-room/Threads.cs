@@ -9,8 +9,8 @@ namespace AgentRoom
     internal sealed partial class RoomService
     {
         private const int ThreadPage = 50;
-        // An ask stays open until a published result or answer reaches its recipients.
-        internal const string OpenAsk = "m.visibility='published' AND m.kind IN ('request','question') AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.reply_to=m.id AND r.kind IN ('result','answer') AND r.visibility='published')";
+        // An ask stays open until a published result or answer reaches its recipients, or its ticket closes.
+        internal const string OpenAsk = "m.visibility='published' AND m.kind IN ('request','question') AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.reply_to=m.id AND r.kind IN ('result','answer') AND r.visibility='published') AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.id=m.task_id AND c.state IN ('done','cancelled'))";
         private const string Visible = "(m.visibility='published' OR m.author=? OR ?=1)";
 
         private object ReadThreads(Dictionary<string, object> actor, Dictionary<string, object> args)
