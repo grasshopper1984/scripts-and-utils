@@ -63,6 +63,9 @@ namespace AgentRoom
                 Check(adapter.Hook(AgyHookInput("unbound")) == null && !Directory.Exists(agyHome), "Unbound Antigravity conversations do not create files or join rooms");
                 var joined = Result(adapter.Join("conv-1", profileFile));
                 Check((string)joined["session"] == "agy:conv-1" && (string)joined["agent"] == "agyworker", "Antigravity adapter binds conversationId");
+                string steady = AgyInjectedMessage(adapter.Hook(AgyHookInput("conv-1", 1, 40)));
+                Check(Encoding.UTF8.GetByteCount(steady) < 1024 && steady.Contains("@agyworker") && steady.Contains(" briefing") && !steady.Contains("# Agent Room"),
+                    "After a join the hook sends a short pointer before each model call, not the whole briefing");
                 var childJoined = Result(Json.Read(RunAgyChild(agyHome, "conv-1", "join --profile " + Quote(profileFile), null)));
                 Result(Json.Read(RunAgyShell(Json.Required(childJoined, "adapter_command") + " status", agyHome)));
                 string binding = Directory.GetFiles(Path.Combine(agyHome, "agent-room", "bindings")).Single();
@@ -103,6 +106,11 @@ namespace AgentRoom
                     "A later invocation with a compacted trajectory receives fresh instructions");
                 Check(Json.Read(RunAgyPackagedHook(plugin, agyHome, Json.Write(AgyHookInput("unbound-conv", 4, 80)))).Count == 0,
                     "Unbound existing conversations receive valid empty hook JSON without joining");
+
+                Result(adapter.Call("conv-1", Json.Obj("cmd", "briefing")));
+                string settled = AgyInjectedMessage(adapter.Hook(AgyHookInput("conv-1", 10, 8)));
+                Check(Encoding.UTF8.GetByteCount(settled) < 1024 && !settled.Contains("After compaction instructions"), "Once the model has re-read the briefing, the hook returns to the pointer");
+                Check(AgyInjectedMessage(adapter.Hook(AgyHookInput("conv-1", 11, 2))).Contains("After compaction instructions"), "A shorter trajectory brings the whole briefing back until it is re-read");
 
                 string full = new string('\u754c', 12000) + "\nFINAL PROTOCOL RULE";
                 string reference = adapter.HookContext("conv-1", Json.Obj("self", "agyworker", "instructions", "Current instructions"), Json.Obj("text", full));

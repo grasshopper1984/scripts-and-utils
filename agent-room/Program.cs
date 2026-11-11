@@ -72,7 +72,7 @@ namespace AgentRoom
                     request = Json.Obj("cmd", options[0], "args", Json.Obj(), "id", Guid.NewGuid().ToString("N"));
                 else throw new RoomError("usage", "Use join, briefing, status, members, feed, inbox, wait, threads, tasks, graph, artifacts, audit, escalations, call FILE, or --mcp.");
                 string requestId = Json.Text(request, "id", "", 100), cmd = Json.Required(request, "cmd", 40);
-                var response = cmd == "wait" ? Waiter.Run(profile, session, Json.Map(request, "args"), CancellationToken.None)
+                var response = cmd == "wait" ? Waiter.Run(profile, session, Json.Map(request, "args"), CancellationToken.None, Waiter.LongMaximum)
                     : Wire.Call(profile, session, cmd, Json.Map(request, "args"), requestId);
                 response["request_id"] = requestId;
                 Console.WriteLine(Json.Write(response));
@@ -189,7 +189,7 @@ namespace AgentRoom
                     else if (method == "tools/list")
                     {
                         result = Json.Obj("tools", new[] { Json.Obj("name", "room_call", "description",
-                            "Local room operations. Reads stay under about 24 KB: on more:true continue from next; a *_truncated field is cut, so read message or task for the full text. join attaches an enrolled identity to this session and returns your role briefing; briefing re-reads it. wait: blocks in the connector until mail arrives (scope inbox|room, after cursor for room, timeout_seconds max 1680, settle_seconds max 60); returns messages, cursor, timed_out, room. Read members/feed(after cursor reads forward)/inbox/tasks/status/audit/artifacts/escalations(state open|unresolved|all). threads: one row per ticket conversation (task_id 0 is the room) with messages, open_asks, last activity. thread: task_id (0 for room), before/after, limit max 50; messages oldest first with open_ask. message: message_id. task: task_id. graph and tasks filters: state(all/unfinished/or a task state),agent,min_priority(0 normal/1 high/2 critical),since/until(exclusive Unix update dates); graph also focus(task ID),limit(max60). Mutations need stable request_id. post: body,kind(note/request/question/result/answer),to(handles; @handle in body also addresses an active participant, other @words stay text),reply_to(message ID; required for answer; a result may reply to a request),status(result only: done/partial/blocked/declined),task_id(inherited from reply_to),task_refs/message_refs/artifact_refs(arrays of string IDs). ack: message_id. task.create: title,objective,acceptance,assigned,parent_id,priority,dependencies/references(string IDs). task.assign (coordinator): task_id,version,assignee (empty to unassign; open unclaimed tickets only). task.claim: task_id,version,optional worktree; workers claim only tickets assigned to them, the coordinator may claim unassigned ones. task.update: task_id,version,state,checkpoint. task.depend: task_id,version,depends_on. task.undepend: task_id,version,depends_on,reason (open tickets only). task.reference: task_id,version,refers_to. task.priority: task_id,version,priority. artifact.register: task_id,title,description,path(absolute file inside configured delivery directory,max256MiB). moderate: action(warn/throttle/mute/unmute/pause/resume),target,reason,seconds(1-900),evidence(string message IDs). escalate (moderator/coordinator): severity(info/warning/urgent),summary,details,task_id,evidence(string message IDs); shows a desktop alert to the OP. budget.reset (moderator, twice per root per day): task_id,reason. heartbeat: status. References provide context; only dependencies block claims. Permissions and moderation are enforced by the hub.",
+                            "Local room operations. Reads stay under about 24 KB: on more:true continue from next; a *_truncated field is cut, so read message or task for the full text. join attaches an enrolled identity to this session and returns your role briefing; briefing re-reads it. wait: blocks in the connector until mail arrives (scope inbox|room, after cursor for room, settle_seconds max 60, ack: string IDs of notes you have read, acknowledged before waiting; omit timeout_seconds to use the room's idle wait); returns messages, cursor, more, timed_out, unread, room. An inbox wait wakes only for mail no earlier wait showed you; a timeout repeats still-unread mail as a reminder, and hub_unreachable:true means the hub did not answer. Read members/feed(after cursor reads forward)/inbox/tasks/status/audit/artifacts/escalations(state open|unresolved|all). threads: one row per ticket conversation (task_id 0 is the room) with messages, open_asks, last activity. thread: task_id (0 for room), before/after, limit max 50; messages oldest first with open_ask. message: message_id. task: task_id. graph and tasks filters: state(all/unfinished/or a task state),agent,min_priority(0 normal/1 high/2 critical),since/until(exclusive Unix update dates); graph also focus(task ID),limit(max60). Mutations need stable request_id. post: body,kind(note/request/question/result/answer),to(handles; @handle in body also addresses an active participant, other @words stay text),reply_to(message ID; required for answer; a result may reply to a request),status(result only: done/partial/blocked/declined),task_id(inherited from reply_to),task_refs/message_refs/artifact_refs(arrays of string IDs). ack: message_id. task.create: title,objective,acceptance,assigned,parent_id,priority,dependencies/references(string IDs). task.assign (coordinator): task_id,version,assignee (empty to unassign; open unclaimed tickets only). task.claim: task_id,version,optional worktree; workers claim only tickets assigned to them, the coordinator may claim unassigned ones. task.update: task_id,version,state,checkpoint. task.depend: task_id,version,depends_on. task.undepend: task_id,version,depends_on,reason (open tickets only). task.reference: task_id,version,refers_to. task.priority: task_id,version,priority. artifact.register: task_id,title,description,path(absolute file inside configured delivery directory,max256MiB). moderate: action(warn/throttle/mute/unmute/pause/resume),target(none for pause/resume, which apply to the whole room),reason,seconds(1-900),evidence(string message IDs). escalate (moderator/coordinator): severity(info/warning/urgent),summary,details,task_id,evidence(string message IDs); shows a desktop alert to the OP. budget.reset (moderator, twice per root per day): task_id,reason. heartbeat: status. References provide context; only dependencies block claims. Permissions and moderation are enforced by the hub.",
                             "inputSchema", Json.Obj("type", "object", "properties", Json.Obj(
                                 "cmd", Json.Obj("type", "string", "enum", Operations),
                                 "args", Json.Obj("type", "object", "additionalProperties", true),
@@ -203,7 +203,12 @@ namespace AgentRoom
                         var arguments = Json.Map(parameters, "arguments");
                         string cmd = Json.Required(arguments, "cmd", 40);
                         if (!Operations.Contains(cmd)) throw new RoomError("unknown_operation", "Operation is not exposed to agents.");
-                        if (cmd == "wait") { StartWait(id, profile, session, Json.Map(arguments, "args")); continue; }
+                        if (cmd == "wait")
+                        {
+                            object progressToken;
+                            Json.Map(parameters, "_meta").TryGetValue("progressToken", out progressToken);
+                            StartWait(id, profile, session, Json.Map(arguments, "args"), progressToken); continue;
+                        }
                         Dictionary<string, object> response;
                         try { response = Wire.Call(profile, session, cmd, Json.Map(arguments, "args"), Json.Text(arguments, "request_id", "", 100)); }
                         catch (RoomError e) { response = Json.Error(e.Code, e.Message); }
@@ -230,8 +235,17 @@ namespace AgentRoom
             return line.Length == 0 && !oversized ? null : line.ToString();
         }
         // A wait runs off the read loop so the agent can keep calling other operations; a newer wait replaces it.
-        private static void StartWait(object id, Dictionary<string, object> profile, string session, Dictionary<string, object> args)
+        private static void StartWait(object id, Dictionary<string, object> profile, string session, Dictionary<string, object> args, object progressToken)
         {
+            // A client that asks for progress hears from the wait every minute. Claude Code counts that as activity
+            // for its 30-minute idle limit on stdio tool calls, so such a wait may run as long as the room allows.
+            int beats = 0;
+            Action beat = progressToken == null ? (Action)null : () =>
+            {
+                string text = Json.Write(Json.Obj("jsonrpc", "2.0", "method", "notifications/progress", "params",
+                    Json.Obj("progressToken", progressToken, "progress", ++beats, "message", "Waiting for room mail")));
+                lock (output) Console.WriteLine(text);
+            };
             string key = Json.Write(id);
             var source = new CancellationTokenSource();
             CancellationTokenSource previous = null;
@@ -244,7 +258,7 @@ namespace AgentRoom
             Task.Run(() =>
             {
                 Dictionary<string, object> response;
-                try { response = Waiter.Run(profile, session, args, source.Token); }
+                try { response = Waiter.Run(profile, session, args, source.Token, progressToken == null ? Waiter.ShortMaximum : Waiter.LongMaximum, beat); }
                 catch (RoomError e) { response = Json.Error(e.Code, e.Message); }
                 catch (Exception) { response = Json.Error("local_error", "The wait could not be completed."); }
                 bool cancelledByClient;

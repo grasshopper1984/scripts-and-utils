@@ -105,6 +105,16 @@ namespace AgentRoom
             return custom.Length == 0 ? "Built-in. Agents receive their role playbook and the message protocol when they join."
                 : "This room overrides: " + String.Join(", ", custom) + "\r\n" + service.RolesDirectory + "\r\nOverridden files no longer follow built-in updates; delete one to return to the built-in version.";
         }
+        private void SetIdleWait()
+        {
+            using (var dialog = new FieldsDialog("Idle wait length"))
+            {
+                dialog.Add("seconds", "Seconds a wait blocks when no mail arrives (60 to 86400). Every time it ends, the waiting agent spends a model call, so use the longest your harnesses keep a call alive: Claude Code needs the progress-aware connector, Codex its background terminal limit, and 1500 is safe everywhere.", waitSeconds.ToString());
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                long seconds; if (!Int64.TryParse((string)dialog.Values()["seconds"], out seconds)) { MessageBox.Show(this, "Enter a number of seconds.", "Agent Room"); return; }
+                Run("room.wait", Json.Obj("seconds", seconds));
+            }
+        }
         private void RestartHub()
         {
             // The executable path may hold a newer build: the build moves a running copy aside instead of overwriting it.

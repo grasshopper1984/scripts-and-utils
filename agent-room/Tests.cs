@@ -194,7 +194,7 @@ namespace AgentRoom
                 Result(f.Call("bob", "ack", Json.Obj("message_id", receipt)));
                 Result(f.Room.Admin("moderate", Json.Obj("action", "resume", "reason", "OP override")));
                 long child = Convert.ToInt64(f.Ticket("Child", "", ticket)["id"]);
-                for (int i = 0; i < 8; i++) Check((string)Result(f.Call("bob", "post", Json.Obj("body", "@alice Question " + i, "kind", "question", "task_id", i % 2 == 0 ? child : ticket)))["visibility"] == "published", "Root budget permits delivery " + i);
+                for (int i = 0; i < 8 + RoomService.SubtaskDeliveries; i++) Check((string)Result(f.Call("bob", "post", Json.Obj("body", "@alice Question " + i, "kind", "question", "task_id", i % 2 == 0 ? child : ticket)))["visibility"] == "published", "Root budget permits delivery " + i);
                 Check((string)Result(f.Call("bob", "post", Json.Obj("body", "@alice Too many", "kind", "question", "task_id", child)))["visibility"] == "held", "Descendants share the root budget");
                 Error(f.Call("alice", "budget.reset", Json.Obj("task_id", ticket, "reason", "More")), "forbidden");
                 Result(f.Room.Admin("budget.reset", Json.Obj("task_id", child, "reason", "Continue this task")));
@@ -483,8 +483,20 @@ namespace AgentRoom
                     Environment.SetEnvironmentVariable("PATH", "");
                     Check(Convert.ToInt64(Result(f.Call("alice", "task.claim", claim, "worktree-claim"))["id"]) == first,
                         "Committed worktree claim can be retried without invoking Git again");
+                    Error(f.Call("bob", "task.claim", Json.Obj("task_id", second, "version", 1, "worktree", worktree)), "git_missing");
                 }
                 finally { Environment.SetEnvironmentVariable("PATH", searchPath); }
+                // Git prints paths as UTF-8 whatever the console code page is, so a repository under a non-ASCII path must still be read.
+                string unicode = Folder("git-中文"); Directory.CreateDirectory(unicode);
+                Git(unicode, "init -b main"); File.WriteAllText(Path.Combine(unicode, "fixture.txt"), "Synthetic test repository");
+                Git(unicode, "add fixture.txt"); Git(unicode, "-c user.name=Test -c user.email=test@example.invalid commit -m fixture");
+                Encoding console = Console.OutputEncoding;
+                try
+                {
+                    try { Console.OutputEncoding = Encoding.GetEncoding(437); } catch (IOException) { /* No console to switch; the read below still runs. */ }
+                    Check(GitWorkspace.Read(unicode).IsMain, "A repository under a non-ASCII path is read under a non-UTF-8 console code page");
+                }
+                finally { try { Console.OutputEncoding = console; } catch (IOException) { } }
                 Error(f.Call("bob", "task.claim", Json.Obj("task_id", second, "version", 1, "worktree", worktree.ToUpperInvariant())), "conflict");
                 Result(f.Call("alice", "task.update", Json.Obj("task_id", first, "version", 2, "state", "paused", "checkpoint", "Quota handoff needs an OP to confirm the old writer stopped")));
                 Error(f.Call("bob", "task.claim", Json.Obj("task_id", second, "version", 1, "worktree", worktree)), "conflict");

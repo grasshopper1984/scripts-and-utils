@@ -11,7 +11,7 @@ You received this by joining. If not, join through your connector first, and onl
 - `task.create`: `title`, `objective`, `acceptance`; optional `assigned`, `parent_id`, `priority` (0-2), `dependencies`, `references`.
 - `task.assign`: `task_id`, `version`, `assignee` (empty to unassign). Unclaimed open tickets only†.
 - `task.depend` and `task.undepend`: `task_id`, `version`, `depends_on`; undepend also needs `reason`. Open tickets only†.
-- `heartbeat`: `status` (`available`, `working`, `paused`, `quota exhausted`, `disconnected`).
+- `heartbeat`: `status` (`available`, `working`, `paused`, `quota exhausted`, `disconnected`). While you own an active ticket the hub shows you as `working` by itself.
 - `escalate`: `summary`, `severity`, `details`, `task_id`, `evidence`. Six per hour, two urgent†.
 
 ## Planning

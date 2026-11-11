@@ -14,6 +14,25 @@ namespace AgentRoom
         internal static readonly string[] ResultStatuses = { "done", "partial", "blocked", "declined" };
         private static readonly string[] Severities = { "info", "warning", "urgent" };
         private const int ModeratorResetsPerDay = 2, EscalationsPerHour = 6, UrgentPerHour = 2;
+        // Loop control. A subtask adds deliveries to its root; addressed notes have a per-recipient allowance.
+        internal const int SubtaskDeliveries = 4, WorkerNotes = 6, SupervisorNotes = 20, NoteWindowSeconds = 1800, TicketsPerHour = 100;
+
+        // When a hold clears, the hub tells each author which posts to send again. Otherwise they would learn it only
+        // from a moderator's note or at their next wait timeout, and an expensive session would sit idle meanwhile.
+        private void AnnounceCleared(string actor, long now, object taskId, string what, string filter, params object[] values)
+        {
+            var held = db.Query("SELECT m.id,m.author FROM messages m JOIN agents a ON a.id=m.author WHERE m.visibility='held' AND m.hold_cleared=0 AND a.revoked=0 AND " + filter + " ORDER BY m.id", values);
+            if (held.Count == 0) return;
+            foreach (var row in held) db.Execute("UPDATE messages SET hold_cleared=? WHERE id=?", now, row["id"]);
+            var authors = held.GroupBy(r => (string)r["author"]).OrderBy(g => g.Key, StringComparer.Ordinal).ToList();
+            string body = "Hold cleared: " + what + ". Post these again with a new request ID; the old IDs stay held. " +
+                String.Join("; ", authors.Select(g => "@" + g.Key + ": " + String.Join(", ", g.Select(r => "#" + r["id"]))));
+            if (body.Length > MaxBodyChars) body = body.Substring(0, MaxBodyChars - 3) + "...";
+            db.Execute("INSERT INTO messages(at,author,kind,body,task_id,visibility,recipients) VALUES(?,?,'note',?,?,'published',?)", now, actor, body, taskId, Json.Write(authors.Select(g => g.Key).ToArray()));
+            long notice = db.LastId;
+            if (taskId != null) db.Execute("INSERT INTO message_tasks(message_id,task_id) VALUES(?,?)", notice, taskId);
+            foreach (var group in authors) if (group.Key != actor) db.Execute("INSERT INTO receipts(message_id,recipient) VALUES(?,?)", notice, group.Key);
+        }
 
         private void MigrateCoordination()
         {
@@ -110,6 +129,8 @@ namespace AgentRoom
             }
             db.Execute("UPDATE tasks SET remaining=8 WHERE id=?", task["root_id"]);
             Audit(id, "budget.reset", Json.Obj("root", task["root_id"], "reason", reason), now);
+            AnnounceCleared(id, now, task["root_id"], "the delivery budget of ticket #" + task["root_id"] + " was reset",
+                "m.held_reason='Root delivery budget exhausted' AND m.task_id IN (SELECT id FROM tasks WHERE root_id=?)", task["root_id"]);
             return Json.Obj("root", task["root_id"], "remaining", 8);
         }
 

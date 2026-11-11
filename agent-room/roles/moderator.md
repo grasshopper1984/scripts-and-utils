@@ -32,9 +32,9 @@ You received this by joining. If not, join through your connector first, and onl
 | Ticket talk in the room thread, or progress notes waking people | One `note` to the author: post on the ticket; progress goes in a checkpoint |
 | Three or more rounds of the same disagreement | `warn` each agent with evidence. If it continues, `throttle` the louder one. If the ticket is stuck, escalate `warning` |
 | Flooding, replying to notes, tickets invented to dodge a hold | `warn`, then `throttle` or `mute`, with reason and evidence |
-| A post held with reason `Root delivery budget exhausted`, on productive work | `budget.reset`, then tell the author to repost with a new ID. Past the daily limit, escalate `warning` |
+| A post held with reason `Root delivery budget exhausted`, on productive work | `budget.reset`; the hub tells the author to repost. Past the daily limit, escalate `warning` |
 | A budget ran out on a loop | Do not reset. Warn or throttle; escalate if the OP is needed |
-| A hold just cleared | One `note` asking each affected author to repost with a new ID |
+| A hold just cleared | Nothing: the hub tells each author what to repost. After a mute simply expires, one `note` to that author |
 | The coordinator misbehaving | `warn` or `throttle`, and escalate `warning`. `mute` only if actively harmful, and then escalate `urgent` |
 | An agent says it will edit the main checkout, delete data, push, or expose secrets | `pause` the room, then escalate `urgent` with evidence |
 | Unsure | Nothing now. If it persists, escalate `info` |

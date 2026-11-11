@@ -15,7 +15,7 @@ namespace AgentRoom
     internal sealed class CodexAdapter
     {
         internal const int HookContextBytes = 32 * 1024;
-        private const string WaitGuidance = "For idle listening, keep the room wait at its 1500-second default (maximum 1680); reserve short room timeouts for deliberate inbox checks during other work. " +
+        private const string WaitGuidance = "For idle listening, run wait with no timeout_seconds so the room's idle wait applies, and pass the IDs of notes you have read as ack on that call; reserve short timeouts for deliberate inbox checks during other work. " +
             "With exec_command/write_stdin, launch one wait, yield the shell call promptly, and poll the returned process session with empty input. " +
             "A shell yield or empty poll is not a room timeout: reuse that process session until it exits; never start a second listener while it is running. " +
             "Every return to you is a model call, so make one call cover the whole wait: write_stdin with yield_time_ms 1500000, and if your tools run through exec, start the script with // @exec: {\"yield_time_ms\": 1500000} and use wait with the same value, never in short slices. These return as soon as the listener exits, so mail is not delayed. Say nothing between polls: a quiet room is normal, so do not write that you are still listening or available. " +
@@ -191,7 +191,7 @@ namespace AgentRoom
             var profile = BoundProfile(Binding(session));
             string cmd = Json.Required(request, "cmd", 40), id = Json.Text(request, "id", "", 100);
             if (cmd == "join") throw new RoomError("usage", "Use codex join --profile FILE for explicit joining.");
-            var response = cmd == "wait" ? Waiter.Run(profile, "codex:" + session, Json.Map(request, "args"), CancellationToken.None)
+            var response = cmd == "wait" ? Waiter.Run(profile, "codex:" + session, Json.Map(request, "args"), CancellationToken.None, Waiter.LongMaximum)
                 : Send(profile, session, cmd, Json.Map(request, "args"), id);
             response["request_id"] = id;
             return response;
@@ -233,6 +233,7 @@ namespace AgentRoom
                 "Use & " + QuotePowerShell(ApplicationPath) + " codex <operation> for this chat's room operations. " +
                 "If CODEX_THREAD_ID is unavailable, pass --session " + QuotePowerShell(session) + ". " +
                 "Use call - with a JSON request (id, cmd, args) for mutations; preserve id and payload on retries. " +
+                "Windows PowerShell 5.1 pipes text to programs as ASCII: start the same command with $OutputEncoding = [Text.UTF8Encoding]::new($false); or non-ASCII text arrives as question marks. " +
                 WaitGuidance +
                 "Read the installed agent-room skill for the CLI workflow.\nRole instructions: " + Json.Text(status, "instructions") + "\n\n" + Json.Required(briefing, "text", 196608);
         }

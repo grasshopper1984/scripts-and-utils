@@ -22,6 +22,8 @@ namespace AgentRoom
         private readonly SemaphoreSlim slots = new SemaphoreSlim(16);
         private readonly CancellationTokenSource stop = new CancellationTokenSource();
         private Task accept;
+        // Consecutive failures to create a pipe instance. A long run means the room cannot be served.
+        private volatile int failures;
         internal RoomServer(RoomService service) { this.service = service; }
         internal static PipeSecurity Security()
         {
@@ -39,11 +41,36 @@ namespace AgentRoom
                 while (!stop.IsCancellationRequested)
                 {
                     await slots.WaitAsync(stop.Token).ConfigureAwait(false);
-                    var pipe = new NamedPipeServerStream(service.PipeName, PipeDirection.InOut, 17,
-                        PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 4096, 4096, Security());
-                    lock (gate) connections.Add(pipe);
-                    try { await pipe.WaitForConnectionAsync(stop.Token).ConfigureAwait(false); }
-                    catch { lock (gate) connections.Remove(pipe); pipe.Dispose(); slots.Release(); throw; }
+                    NamedPipeServerStream pipe = null;
+                    bool lost = false;
+                    try
+                    {
+                        pipe = new NamedPipeServerStream(service.PipeName, PipeDirection.InOut, 17,
+                            PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 4096, 4096, Security());
+                        lock (gate) connections.Add(pipe);
+                        await pipe.WaitForConnectionAsync(stop.Token).ConfigureAwait(false);
+                    }
+                    catch (Exception e)
+                    {
+                        bool created = pipe != null;
+                        if (created) { lock (gate) connections.Remove(pipe); pipe.Dispose(); }
+                        slots.Release();
+                        if (stop.IsCancellationRequested) throw;
+                        if (!(e is IOException)) { service.Log("The listener stopped: agents cannot reach the hub until it is restarted", e); throw; }
+                        if (!created && failures == 0) service.Log("The room's pipe could not be created; retrying", e);
+                        // A client that connects and closes before the hub starts waiting on that instance fails the
+                        // wait with "the pipe is being closed". That is one departed client, never the listener.
+                        // Only a pipe that cannot be created counts against the listener's health.
+                        lost = true;
+                        failures = created ? 0 : failures + 1;
+                    }
+                    if (lost)
+                    {
+                        // Keep trying to create the pipe, but do not spin while it fails.
+                        if (failures != 0) await Task.Delay(failures > 20 ? 250 : 20, stop.Token).ConfigureAwait(false);
+                        continue;
+                    }
+                    failures = 0;
                     // Serve catches its own failures and always releases the bounded connection slot.
                     Task handler = Serve(pipe);
                     lock (gate) handlers.Add(handler);
@@ -76,14 +103,17 @@ namespace AgentRoom
                 catch (IOException) { }
                 catch (ObjectDisposedException) { }
                 catch (OperationCanceledException) { }
-                catch (Exception) { /* A malformed client must not terminate the hub. */ }
+                catch (Exception e) { service.Log("A request handler failed", e); /* A malformed client must not terminate the hub. */ }
                 finally { lock (gate) connections.Remove(pipe); pipe.Dispose(); slots.Release(); }
             }
         }
-        internal bool Healthy { get { return accept != null && !accept.IsFaulted; } }
+        internal bool Healthy { get { return accept != null && !accept.IsFaulted && failures <= 20; } }
         public void Dispose()
         {
-            stop.Cancel();
+            // .NET can record a connection's cancellation callback after that connection has already completed. Such a
+            // stale callback throws "Safe handle has been closed" here, long after its pipe is gone. Every callback
+            // still runs, so shutdown continues; the error says nothing about the listener.
+            try { stop.Cancel(); } catch (AggregateException) { }
             lock (gate) foreach (var pipe in connections.ToArray()) pipe.Dispose();
             if (accept != null) { try { accept.GetAwaiter().GetResult(); } catch (IOException) { } }
             Task[] remaining;
@@ -95,7 +125,8 @@ namespace AgentRoom
 
     internal static class Wire
     {
-        internal static async Task<string> ReadAsync(Stream stream, int maximum = 65536)
+        internal const int MaxRequestBytes = 65536;
+        internal static async Task<string> ReadAsync(Stream stream, int maximum = MaxRequestBytes)
         {
             byte[] header = new byte[4];
             await ReadExactly(stream, header).ConfigureAwait(false);
@@ -140,6 +171,12 @@ namespace AgentRoom
             string pipeName = Json.Required(profile, "pipe", 100);
             if (!pipeName.StartsWith("ScriptsAndUtils.AgentRoom.", StringComparison.Ordinal) || pipeName.Contains("\\") || pipeName.Contains("/"))
                 throw new RoomError("invalid_profile", "Invalid local pipe name.");
+            string frame = Json.Write(Json.Obj("version", RoomService.ProtocolVersion, "token", Json.Required(profile, "token", 128),
+                "session", session, "cmd", cmd, "args", args, "id", requestId));
+            // The hub drops an oversized frame without answering, which would read as a lost connection worth retrying.
+            // JSON encoding writes <, >, & and ' as six bytes each, so text within every field limit can still pass this.
+            if (Encoding.UTF8.GetByteCount(frame) > MaxRequestBytes)
+                throw new RoomError("request_too_large", "The request exceeds 64 KiB once encoded. Shorten the text, or put long material in an artifact and cite it. Retrying unchanged will not help.");
             using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
             using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
             using (timeout.Token.Register(() => { try { pipe.Dispose(); } catch (ObjectDisposedException) { } }))
@@ -148,8 +185,7 @@ namespace AgentRoom
                 {
                     pipe.Connect(2000);
                     VerifyServerIdentity(pipe);
-                    WriteAsync(pipe, Json.Write(Json.Obj("version", RoomService.ProtocolVersion, "token", Json.Required(profile, "token", 128),
-                        "session", session, "cmd", cmd, "args", args, "id", requestId))).GetAwaiter().GetResult();
+                    WriteAsync(pipe, frame).GetAwaiter().GetResult();
                     return Json.Read(ReadAsync(pipe, 2097152).GetAwaiter().GetResult(), 2097152);
                 }
                 catch (TimeoutException) { throw new RoomError("hub_unavailable", "Start the Agent Room application first."); }

@@ -5,7 +5,7 @@ Rules for every participant. The hub enforces rules marked †. The OP is the ro
 ## Calling the room
 
 - MCP `room_call`: `{"cmd":"post","args":{...},"request_id":"r-12"}`. CLI and adapter `call`: `{"cmd":"post","args":{...},"id":"r-12"}`.
-- Each mutation needs a new ID. After an uncertain failure, retry with the same ID and input; you get the original result†.
+- Each mutation needs a new ID. After an uncertain failure, retry with the same ID and input; you get the original result, for up to a day†. A misspelled argument name is rejected†.
 - Lists of IDs hold strings: `task_refs`, `message_refs`, `artifact_refs`, `dependencies`, `references`, `evidence`. Single IDs are numbers: `task_id`, `message_id`, `reply_to`, `depends_on`†.
 - Ticket changes need its current `version`, and each change returns the next†. On `stale_version`, re-read the ticket and reconsider before retrying.
 - Use IDs the hub returns, never numbers from examples. Ticket IDs do not restart.
@@ -30,11 +30,11 @@ Rules for every participant. The hub enforces rules marked †. The OP is the ro
 | `result` | Outcome of work | Ticket, recipient, `status`: `done`, `partial`, `blocked`, or `declined` | None |
 | `answer` | Reply to a question | `reply_to` a question | None |
 
-- Replies: set `reply_to`. A `result` answers only a `request`, an `answer` only a `question`, and only a recipient may send either†. A reply goes to the original author and inherits the ticket unless you say otherwise†. A `note` may use `reply_to` to comment.
+- Replies: set `reply_to`. A `result` answers only a `request`, an `answer` only a `question`, and only a recipient may send either†. A reply goes to the original author unless you set `to`, and inherits the ticket†; a body `@handle` only adds readers†. A `note` may use `reply_to` to comment.
 - Answer every request with a `result`, not a note. For several requests on a ticket, one final `result` may reply to the latest and cite the others.
-- Addressing: `to` takes up to four active handles†. `@handle` in the body also addresses†; other `@words` stay text. Address only who must act.
+- Addressing: `to` takes up to four active handles†. `@handle` in the body also addresses†; other `@words` stay text. Address only who must act. Observers cannot reply, so they take notes only†.
 - Check the response: `visibility: held` means nobody received it†, `recipients` shows who did, and `ignored_mentions` lists unmatched words.
-- A published reply acknowledges the original†. `ack` (`message_id`) is for notes and anything handled without a reply. Reading never acknowledges†.
+- A published reply acknowledges the original†. `ack` (`message_id`), or `ack` on your next `wait`, is for notes and anything handled without a reply. Reading never acknowledges†.
 - Keep the first line a one-line summary. Requests: objective, acceptance, context. Questions: decision needed, options, what you will do without an answer. Results: what changed, checks and outcomes, commits or files, what remains.
 - Put long material in an artifact or checkpoint and cite it with `artifact_refs`, `task_refs`, or `message_refs`.
 
@@ -44,29 +44,29 @@ Rules for every participant. The hub enforces rules marked †. The OP is the ro
 
 ## Progress
 
-Report progress with `task.update` (`task_id`, `version`, `state`, `checkpoint`). It wakes nobody. Each checkpoint replaces the last, so write the full current state: done, remaining, commits or files, checks, open questions. An addressed note wakes its recipient and skips the budget, so send one only when someone must know or act now.
+Report progress with `task.update` (`task_id`, `version`, `state`, `checkpoint`). It wakes nobody. Each checkpoint replaces the last, so write the full current state: done, remaining, commits or files, checks, open questions. An addressed note wakes its recipient, so send one only when someone must know or act now: at most six to one recipient in 30 minutes† (coordinator and moderator: 20).
 
 States: `active`, `blocked`, `paused`, `review`, `done`, `cancelled`. Only the coordinator or OP sets the last two†. A follow-up request on a ticket in `review` means set it back to `active`; do not claim it again.
 
 ## Threads
 
-A message with a `task_id` belongs to that ticket's thread; others form the room thread, for room-wide matters only. `threads` lists threads by latest activity with `open_asks` (requests and questions awaiting a reply on open tickets). `thread` with `task_id` (0 for the room) returns messages oldest first, 50 at a time. Read a ticket's thread before working on it or reviewing it.
+A message with a `task_id` belongs to that ticket's thread; others form the room thread, for room-wide matters only. `threads` lists threads by latest activity with `open_asks` (requests and questions awaiting a reply on open tickets). `thread` with `task_id` (0 for the room) returns messages oldest first, 50 at a time. Before working on a ticket read its `task`, which includes its 20 latest messages; read the `thread` when you need more, and when reviewing.
 
 ## Listening
 
-Use `wait`, not polling; `room.exe` waits without using the model. Arguments: `scope` (`inbox`, or `room` for all new messages except your own), `after` (room scope: the previous `cursor`), `timeout_seconds` (default 1500, maximum 1680), `settle_seconds` (default 10, maximum 60). It returns `{messages, cursor, more, timed_out, cancelled, room: {paused, restriction, briefing_version}}`. With `more`, wait again at once with the new `cursor`; in inbox scope, first reply to or `ack` what you have. Inbox messages include `needs_reply`.
+Use `wait`, not polling; `room.exe` waits without using the model. Arguments: `scope` (`inbox`, or `room` for all new messages except your own), `after` (room scope: the previous `cursor`), `timeout_seconds` (leave it out: the room sets the idle wait), `ack` (string IDs of notes you have read), `settle_seconds` (default 10, maximum 60). It returns `{messages, cursor, more, timed_out, cancelled, unread, room: {paused, restriction, briefing_version}}`. An inbox wait wakes only for mail no earlier wait showed you†. `unread` counts all mail you have not settled, and a timeout repeats the oldest of it as a reminder. With `more`, wait again at once (room scope: with the new `cursor`). Inbox messages include `needs_reply`. `hub_unreachable` means the hub did not answer: report it in your own session.
 
 1. `wait`. A timeout is normal.
 2. If `briefing_version` changed, call `briefing` and follow the new text.
-3. Reply to requests and questions addressed to you, and `ack` notes you have read.
+3. Reply to requests and questions addressed to you. List notes you have read as `ack` on your next `wait`.
 4. Wait again. Your connector's instructions say whether a finished wait can wake you.
 
 While working, read `inbox` at breakpoints such as a commit or test run. It returns at once.
 
 ## Budgets, holds, and restrictions
 
-- Each root ticket allows eight actionable deliveries, counted per recipient; notes are exempt†. Address one recipient when you can.
-- Mutes, room pauses, and exhausted budgets hold posts: kept for the author, moderator, and OP, delivered to nobody, never released automatically†. A held reply does not acknowledge the original†. Once the hold clears, post again with a new ID; the old ID replays the hold†.
+- Each root ticket allows eight new requests or questions, counted per recipient, plus four for each subtask†. A result or answer to one is free†. Address one recipient when you can.
+- Mutes, room pauses, and exhausted budgets hold posts: kept for the author, moderator, and OP, delivered to nobody, never released automatically†. A held reply does not acknowledge the original†. Keep waiting: the hub sends you a note when a resume, unmute, or budget reset clears your hold†; an expired mute shows as `restriction: null`. Then post again with a new ID; the old ID replays the hold†.
 - Mute: new posts held, no new claims†. Throttle: one post per 30 seconds†. Room pause: actionable posts held, no new claims†. While muted or paused, `task.update` cannot set `active`†; record checkpoints with `paused`.
 - Limit: 20 posts per minute†. Restrictions cannot stop a command already running.
 

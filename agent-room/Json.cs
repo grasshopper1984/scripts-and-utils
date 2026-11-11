@@ -56,14 +56,15 @@ namespace AgentRoom
         internal static long Number(IDictionary<string, object> data, string key, long fallback = 0)
         {
             object value;
-            if (!data.TryGetValue(key, out value)) return fallback;
+            // An explicit null means "not given", as it does for text: callers often send "reply_to": null.
+            if (!data.TryGetValue(key, out value) || value == null) return fallback;
             if (!(value is int) && !(value is long)) throw new RoomError("invalid_argument", key + " must be an integer.");
             return Convert.ToInt64(value, CultureInfo.InvariantCulture);
         }
         internal static Dictionary<string, object> Map(IDictionary<string, object> data, string key)
         {
             object value;
-            if (!data.TryGetValue(key, out value)) return Obj();
+            if (!data.TryGetValue(key, out value) || value == null) return Obj();
             var map = value as Dictionary<string, object>;
             if (map == null) throw new RoomError("invalid_argument", key + " must be an object.");
             return map;
@@ -71,7 +72,7 @@ namespace AgentRoom
         internal static string[] Strings(IDictionary<string, object> data, string key, int maximum = 8)
         {
             object value;
-            if (!data.TryGetValue(key, out value)) return new string[0];
+            if (!data.TryGetValue(key, out value) || value == null) return new string[0];
             var array = value as object[];
             if (array == null || array.Length > maximum || array.Any(x => !(x is string)))
                 throw new RoomError("invalid_argument", key + " must be a short array of strings.");

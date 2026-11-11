@@ -47,6 +47,11 @@ namespace AgentRoom
                 db.Execute("DROP TABLE agents");
                 db.Execute("CREATE TABLE agents(id TEXT PRIMARY KEY,permission TEXT NOT NULL,instructions TEXT NOT NULL,token_hash TEXT UNIQUE,session TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'not joined',last_seen INTEGER NOT NULL DEFAULT 0,revoked INTEGER NOT NULL DEFAULT 0,connector TEXT NOT NULL DEFAULT 'generic')");
                 db.Execute("INSERT INTO agents(id,permission,instructions,status,last_seen) VALUES('human','human','Existing operator instructions','available',1234)");
+                // Schema 8 added a column to each of these tables. They are empty too, so give them back their earlier shape.
+                db.Execute("DROP TABLE requests");
+                db.Execute("CREATE TABLE requests(actor TEXT NOT NULL REFERENCES agents(id), id TEXT NOT NULL, digest TEXT NOT NULL, response TEXT NOT NULL, PRIMARY KEY(actor,id))");
+                db.Execute("DROP TABLE messages");
+                db.Execute("CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, author TEXT NOT NULL REFERENCES agents(id), kind TEXT NOT NULL, body TEXT NOT NULL, task_id INTEGER REFERENCES tasks(id), visibility TEXT NOT NULL, held_reason TEXT NOT NULL DEFAULT '', recipients TEXT NOT NULL, reply_to INTEGER REFERENCES messages(id), status TEXT NOT NULL DEFAULT '')");
                 db.Execute("PRAGMA user_version=5");
             }
             return directory;

@@ -50,7 +50,8 @@ namespace AgentRoom
         private long displayedRevision = -1, graphFocus;
         private int viewEpoch, detailsEpoch;
         private DateTime lastRefresh;
-        private bool loading, quitting, paused, rendering;
+        private bool loading, quitting, paused, rendering, listenerAlerted;
+        private long waitSeconds = RoomService.DefaultWaitSeconds;
         private string inboxAgent = "", artifactDirectory = "", memberSignature = "", graphSignature = "";
 
         private sealed class PageView
@@ -131,7 +132,7 @@ namespace AgentRoom
             var workspacePage = NewPage("Workspace", "Workspace", "Repository, delivery directory, and where this room keeps its data.", false);
             AddButton(workspacePage.Tools, "Repository...", ConfigureRepository); AddButton(workspacePage.Tools, "Delivery directory...", ConfigureArtifacts);
             AddButton(workspacePage.Tools, "Customize playbooks", CustomizePlaybooks); AddButton(workspacePage.Tools, "Restart hub", RestartHub);
-            AddMenu(workspacePage.Tools, "More", "Open delivery folder", (Action)delegate { OpenFolder(artifactDirectory); }, "Open room data", (Action)delegate { OpenFolder(service.DirectoryPath); });
+            AddMenu(workspacePage.Tools, "More", "Idle wait length...", (Action)SetIdleWait, "Open delivery folder", (Action)delegate { OpenFolder(artifactDirectory); }, "Open room data", (Action)delegate { OpenFolder(service.DirectoryPath); });
             Assemble(workspacePage, Card(workspaceDetails));
 
             // Parent the shared filter row before layout scaling; it moves between the Tasks and Graph pages later.
@@ -156,7 +157,7 @@ namespace AgentRoom
             tray.DoubleClick += delegate { Show(); WindowState = FormWindowState.Normal; Activate(); };
             tray.BalloonTipClicked += delegate { Show(); WindowState = FormWindowState.Normal; Activate(); ShowPage("Attention"); };
             // Escalation alerts must reach the OP while the window sits hidden in the tray.
-            refresh.Tick += delegate { if (Visible) RefreshRoom(); else if (++attentionCheck % 3 == 0) CheckAttention(); };
+            refresh.Tick += delegate { CheckListener(); if (Visible) RefreshRoom(); else if (++attentionCheck % 3 == 0) CheckAttention(); };
             Shown += delegate { SizeColumns(); tray.Visible = true; refresh.Start(); RefreshRoom(); }; DpiChanged += delegate { SizeColumns(); };
             FormClosing += delegate(object sender, FormClosingEventArgs e) { if (!quitting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
             ShowPage("Attention", false); ResumeLayout(true);
@@ -276,7 +277,7 @@ namespace AgentRoom
                 }
                 if (inboxAgent == "" && inboxAgentChoice.Items.Count != 0) inboxAgent = (string)inboxAgentChoice.Items[0];
                 if (inboxAgentChoice.Text != inboxAgent) inboxAgentChoice.SelectedItem = inboxAgent;
-                var room = (Dictionary<string, object>)snapshot["status"]; paused = (bool)room["paused"]; artifactDirectory = (string)room["artifact_directory"];
+                var room = (Dictionary<string, object>)snapshot["status"]; paused = (bool)room["paused"]; artifactDirectory = (string)room["artifact_directory"]; waitSeconds = Convert.ToInt64(room["wait_seconds"]);
                 pause.Text = paused ? "Resume room" : "Pause room";
                 bool moderator = people.Any(r => (string)r["permission"] == "moderator" && Convert.ToInt64(r["revoked"]) == 0 && Convert.ToInt64(r["last_seen"]) != 0);
                 roomState.Text = (server.Healthy ? "● Hub running locally" : "● Hub error") + "\r\n" +
@@ -284,7 +285,9 @@ namespace AgentRoom
                     (moderator ? "● Moderator joined" : "○ No moderator joined") + "\r\n" +
                     (Rows(snapshot["open"]).Count == 0 ? "● Nothing needs you" : "▲ " + Rows(snapshot["open"]).Count + " escalation(s) open");
                 ShowAttention(Rows(snapshot["open"]));
-                SetText(workspaceDetails, "Main checkout\r\n" + Empty((string)room["repository"]) + "\r\n\r\nArtifact delivery directory\r\n" + Empty(artifactDirectory) + "\r\n\r\nRoom database and profiles\r\n" + service.DirectoryPath + "\r\n\r\nRole playbooks\r\n" + PlaybookSummary() + "\r\n\r\nCode and history stay in Git. Editing agents reserve separate worktrees.\r\nDeliver files into the artifact directory, then register them against a ticket.\r\nRegistration records the path, size, and SHA256; it does not copy or freeze a file.\r\nThe coordinator integrates work through its own harness.");
+                SetText(workspaceDetails, "Main checkout\r\n" + Empty((string)room["repository"]) + "\r\n\r\nArtifact delivery directory\r\n" + Empty(artifactDirectory) + "\r\n\r\nRoom database and profiles\r\n" + service.DirectoryPath + "\r\n\r\nRole playbooks\r\n" + PlaybookSummary() +
+                    "\r\n\r\nIdle wait\r\n" + (waitSeconds % 60 == 0 ? waitSeconds / 60 + " minutes" : waitSeconds + " seconds") + ". Each time a wait ends with no mail, the waiting agent spends a model call; a longer wait means fewer. Change it under More." +
+                    "\r\n\r\nDiagnostics\r\n" + Path.Combine(service.DirectoryPath, "diagnostics.log") +"\r\n\r\nCode and history stay in Git. Editing agents reserve separate worktrees.\r\nDeliver files into the artifact directory, then register them against a ticket.\r\nRegistration records the path, size, and SHA256; it does not copy or freeze a file.\r\nThe coordinator integrates work through its own harness.");
                 if (view == "Agents")
                 {
                     foreach (var person in people)
@@ -333,6 +336,14 @@ namespace AgentRoom
             if (view == "Agents") SetText(agentDetails, AgentText(Selected(agents)));
             if (view == "Moderation") SetText(auditDetails, AuditText(Selected(audit)));
             if (view == "Attention") SetText(attentionDetails, AttentionText(Selected(attention)));
+        }
+        // Agents see a hub that cannot accept connections only as quiet waits, so the OP has to be told, even from the tray.
+        private void CheckListener()
+        {
+            if (server.Healthy) { listenerAlerted = false; return; }
+            if (listenerAlerted || !tray.Visible) return;
+            listenerAlerted = true;
+            tray.ShowBalloonTip(15000, "Agent Room cannot accept connections", "Agents cannot reach the hub. Choose Restart hub from this icon's menu. The cause is in diagnostics.log in the room's data folder.", ToolTipIcon.Error);
         }
         private async void CheckAttention()
         {

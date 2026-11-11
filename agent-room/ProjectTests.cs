@@ -189,7 +189,8 @@ namespace AgentRoom
                     for (int i = 0; i < 30; i++)
                     {
                         f.Now += 4;
-                        ids.Add(Convert.ToInt64(Result(f.Call("coordinator", "post", Json.Obj("body", body, "to", new[] { "alice" }, "task_id", ticket)))["message_id"]));
+                        // Posted by the OP, whose notes are outside the per-recipient note allowance.
+                        ids.Add(Convert.ToInt64(Result(f.Room.Admin("post", Json.Obj("body", body, "to", new[] { "alice" }, "task_id", ticket)))["message_id"]));
                     }
 
                     // Every list read stays within budget and pages through all rows without gaps or repeats.

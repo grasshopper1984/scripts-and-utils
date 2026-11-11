@@ -10,7 +10,10 @@ namespace AgentRoom
     internal sealed partial class RoomService : IDisposable
     {
         internal const int ProtocolVersion = 2;
-        internal const int SchemaVersion = 7;
+        internal const int SchemaVersion = 8;
+        // A committed mutation is replayed for a day. After that its request ID is free again, so an ID an agent
+        // happens to reuse weeks later runs the operation instead of silently returning the old result.
+        internal const long ReplaySeconds = 86400;
         private readonly object gate = new object();
         private readonly Database db;
         private readonly Func<long> clock;
@@ -62,6 +65,16 @@ namespace AgentRoom
                 if (schema < 5) db.Execute("ALTER TABLE agents ADD COLUMN connector TEXT NOT NULL DEFAULT 'generic'");
                 if (schema < 6) MigrateOperatorIdentity();
                 if (schema < 7) MigrateConnectionSessions();
+                // Version 8 dates idempotency records so they can expire, and marks held posts whose author was told the hold cleared.
+                if (schema < 8)
+                {
+                    db.Execute("ALTER TABLE requests ADD COLUMN at INTEGER NOT NULL DEFAULT 0");
+                    db.Execute("ALTER TABLE messages ADD COLUMN hold_cleared INTEGER NOT NULL DEFAULT 0");
+                    // Existing records keep one more day of replay; holds from before the upgrade are not announced.
+                    db.Execute("UPDATE requests SET at=?", this.clock());
+                    db.Execute("UPDATE messages SET hold_cleared=? WHERE visibility='held'", this.clock());
+                }
+                db.Execute("DELETE FROM requests WHERE at<?", this.clock() - ReplaySeconds);
                 db.Execute("INSERT OR IGNORE INTO agents(id,permission,instructions,status) VALUES('op','op','Room operator','available')");
                 // Thread views read messages by ticket and look up replies; both indexes are safe to recreate.
                 db.Execute("CREATE INDEX IF NOT EXISTS messages_thread ON messages(task_id,id)");
@@ -80,11 +93,44 @@ namespace AgentRoom
                     Json.Required(request, "cmd", 40), Json.Map(request, "args"), Json.Text(request, "id", "", 100));
             }
             catch (RoomError e) { return Json.Error(e.Code, e.Message); }
-            catch (Exception) { return Json.Error("internal_error", "The request could not be completed."); }
+            catch (Exception e)
+            {
+                Log("Internal error in " + (request.ContainsKey("cmd") ? Convert.ToString(request["cmd"]) : "a request"), e);
+                return Json.Error("internal_error", "The request could not be completed. The OP can find the cause in diagnostics.log in the room's data folder.");
+            }
         }
         internal Dictionary<string, object> Admin(string operation, Dictionary<string, object> args = null, string requestId = null)
         {
-            return Invoke(true, "", "", operation, args ?? Json.Obj(), requestId ?? Guid.NewGuid().ToString("N"));
+            try { return Invoke(true, "", "", operation, args ?? Json.Obj(), requestId ?? Guid.NewGuid().ToString("N")); }
+            catch (RoomError) { throw; }
+            catch (Exception e) { Log("Internal error in " + operation + " (operator)", e); throw; }
+        }
+        // Failures that would otherwise vanish behind a generic message go to a local, size-bounded file.
+        internal void Log(string what, Exception error = null) { RoomLog.Write(DirectoryPath, what, error); }
+
+        // Argument names each agent operation accepts. A misspelled name used to be ignored, so a post meant for a
+        // ticket ("ticket": 5) landed in the room thread; now the caller is told which names exist.
+        private static readonly Dictionary<string, string> Accepted = new Dictionary<string, string> {
+            { "join", "" }, { "briefing", "role" }, { "members", "" }, { "status", "" }, { "heartbeat", "status" },
+            { "feed", "before after limit task_id" }, { "inbox", "after limit" }, { "audit", "before limit" },
+            { "tasks", "state agent min_priority since until before limit" }, { "graph", "state agent min_priority since until focus limit" },
+            { "message", "message_id" }, { "task", "task_id" }, { "artifacts", "task_id before limit" }, { "escalations", "state before limit" },
+            { "threads", "before limit" }, { "thread", "task_id before after limit" },
+            { "post", "body kind to reply_to status task_id task_refs message_refs artifact_refs" }, { "ack", "message_id" }, { "inbox.seen", "message_id" },
+            { "task.create", "title objective acceptance assigned parent_id priority dependencies references" }, { "task.assign", "task_id version assignee" },
+            { "task.claim", "task_id version worktree" }, { "task.update", "task_id version state checkpoint" },
+            { "task.depend", "task_id version depends_on" }, { "task.undepend", "task_id version depends_on reason" },
+            { "task.reference", "task_id version refers_to" }, { "task.priority", "task_id version priority" },
+            { "artifact.register", "task_id title description path" }, { "moderate", "action target reason seconds evidence" },
+            { "escalate", "summary severity details task_id evidence" }, { "budget.reset", "task_id reason" } };
+        private static void RejectUnknownArguments(string operation, Dictionary<string, object> args)
+        {
+            string accepted;
+            if (args.Count == 0 || !Accepted.TryGetValue(operation, out accepted)) return;
+            string[] names = accepted.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            string unknown = args.Keys.FirstOrDefault(key => !names.Contains(key));
+            if (unknown != null) throw new RoomError("unknown_argument", operation + " has no argument named " + unknown + ". " +
+                (names.Length == 0 ? "It takes no arguments." : "It takes: " + String.Join(", ", names) + "."));
         }
         private Dictionary<string, object> Authenticate(bool isOperator, string token, string session, string operation)
         {
@@ -107,7 +153,8 @@ namespace AgentRoom
             lock (gate)
             {
                 var preflightActor = Authenticate(isOperator, token, session, operation);
-                var cached = readOnly ? null : Cached(preflightActor, session, operation, requestId, digest);
+                if (!isOperator) RejectUnknownArguments(operation, args);
+                var cached = readOnly ? null : Cached(preflightActor, session, operation, requestId, digest, clock());
                 if (cached != null) return cached;
                 if (operation == "repository") Require(preflightActor, "op");
                 if (operation == "task.claim") Require(preflightActor, "op", "coordinator", "worker");
@@ -135,7 +182,7 @@ namespace AgentRoom
                     return isOperator ? Json.Ok(read) : Bounded(operation, read, args);
                 }
                 // Another caller may have committed this request while Git inspection ran.
-                var cached = Cached(actor, session, operation, requestId, digest);
+                var cached = Cached(actor, session, operation, requestId, digest, now);
                 if (cached != null) return cached;
                 db.Execute("BEGIN IMMEDIATE");
                 try
@@ -145,7 +192,7 @@ namespace AgentRoom
                     // A credential is returned once to the OP, never written into the database ledger.
                     object persisted = operation == "agent.enroll" || operation == "agent.rotate"
                         ? Json.Error("profile_already_issued", "Profile was already issued. Renew it in the GUI if the file was lost.") : response;
-                    db.Execute("INSERT INTO requests(actor,id,digest,response) VALUES(?,?,?,?)", actorId, requestId, digest, Json.Write(persisted));
+                    db.Execute("INSERT INTO requests(actor,id,digest,response,at) VALUES(?,?,?,?,?)", actorId, requestId, digest, Json.Write(persisted), now);
                     db.Execute("UPDATE agents SET last_seen=? WHERE id=?", now, actorId);
                     db.Execute("COMMIT");
                     Interlocked.Increment(ref revision);
@@ -154,10 +201,12 @@ namespace AgentRoom
                 catch { db.Execute("ROLLBACK"); throw; }
             }
         }
-        private Dictionary<string, object> Cached(Dictionary<string, object> actor, string session, string operation, string requestId, string digest)
+        private Dictionary<string, object> Cached(Dictionary<string, object> actor, string session, string operation, string requestId, string digest, long now)
         {
-            var cached = db.One("SELECT digest,response FROM requests WHERE actor=? AND id=?", actor["id"], requestId);
+            var cached = db.One("SELECT digest,response,at FROM requests WHERE actor=? AND id=?", actor["id"], requestId);
             if (cached == null) return null;
+            // Past its replay window the record is gone and the ID is free again.
+            if (now - Convert.ToInt64(cached["at"]) > ReplaySeconds) { db.Execute("DELETE FROM requests WHERE actor=? AND id=?", actor["id"], requestId); return null; }
             if ((string)cached["digest"] != digest) throw new RoomError("request_id_reused", "That request ID was already used with different input.");
             // A join retry may replay success only while that membership still exists. Never
             // reattach a reset session or hide a replacement owner behind a cached response.
@@ -182,7 +231,7 @@ namespace AgentRoom
             if (cmd == "threads") return ReadThreads(actor, args);
             if (cmd == "thread") return ReadThread(actor, args);
             // A cursor reads forward, oldest first, so a listener can resume where it stopped.
-            if (cmd == "feed" && args.ContainsKey("after")) return db.Query("SELECT * FROM messages WHERE id>? AND (visibility='published' OR author=? OR ?=1) ORDER BY id LIMIT ?", Json.Number(args, "after"), id, supervision ? 1 : 0, limit);
+            if (cmd == "feed" && args.ContainsKey("after")) return db.Query("SELECT * FROM messages WHERE id>? AND (visibility='published' OR author=? OR ?=1) AND (?=0 OR id IN (SELECT message_id FROM message_tasks WHERE task_id=?)) ORDER BY id LIMIT ?", Json.Number(args, "after"), id, supervision ? 1 : 0, Json.Number(args, "task_id"), Json.Number(args, "task_id"), limit);
             if (cmd == "feed") return db.Query("SELECT * FROM messages WHERE id<? AND (visibility='published' OR author=? OR ?=1) AND (?=0 OR id IN (SELECT message_id FROM message_tasks WHERE task_id=?)) ORDER BY id DESC LIMIT ?", before, id, supervision ? 1 : 0, Json.Number(args, "task_id"), Json.Number(args, "task_id"), limit);
             if (cmd == "inbox") return db.Query("SELECT m.*,CASE WHEN m.kind IN ('request','question') THEN 1 ELSE 0 END AS needs_reply FROM messages m JOIN receipts r ON r.message_id=m.id WHERE r.recipient=? AND r.acknowledged IS NULL AND m.id>? ORDER BY m.id LIMIT ?", id, Json.Number(args, "after"), limit);
             if (cmd == "tasks")
@@ -202,6 +251,7 @@ namespace AgentRoom
             return Json.Obj("paused", Paused, "paused_by", Setting("paused_by"), "repository", Setting("repository"), "artifact_directory", Setting("artifact_directory"), "data_directory", DirectoryPath, "self", id,
                 "permission", actor["permission"], "instructions", actor["instructions"],
                 "restriction", Restriction(id, now), "briefing_version", BriefingVersion(actor), "delivery", "durable inbox; use the connector's wait operation to block until mail arrives",
+                "unread", Count("SELECT COUNT(*) AS n FROM receipts WHERE recipient=? AND acknowledged IS NULL", id), "inbox_seen", InboxSeen(id), "wait_seconds", WaitSeconds,
                 "protocol", ProtocolVersion, "latest_message", Count("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='messages'),0) AS n"));
         }
         private object Mutate(Dictionary<string, object> actor, string session, string cmd,
@@ -216,6 +266,8 @@ namespace AgentRoom
                 if ((string)actor["session"] != "" && (string)actor["session"] != session)
                     throw new RoomError("session_conflict", "Another session owns this profile. Ask the OP to reset it.");
                 db.Execute("UPDATE agents SET session=?,status='available' WHERE id=?", session, id);
+                // A session that has just joined has been shown nothing, so its first wait reports every unread message.
+                SetSetting(InboxSeenKey + id, "0");
                 Audit(id, cmd, Json.Obj("agent", id), now);
                 // The role briefing arrives with the join, so no skill has to be installed before the session starts.
                 return Json.Obj("agent", id, "permission", actor["permission"], "instructions", actor["instructions"], "briefing", Briefing((string)actor["permission"]));
@@ -227,6 +279,15 @@ namespace AgentRoom
                     throw new RoomError("invalid_argument", "Unknown status.");
                 db.Execute("UPDATE agents SET status=? WHERE id=?", status, id);
                 return Json.Obj("status", status);
+            }
+            if (cmd == "inbox.seen")
+            {
+                // A finished wait records the newest mail it reported. Later waits wake only for newer mail, so unread mail
+                // that cannot be settled yet (a request whose reply is held) does not wake its recipient again and again.
+                long latest = Count("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='messages'),0) AS n");
+                long seen = Math.Max(InboxSeen(id), Math.Min(latest, Json.Number(a, "message_id")));
+                SetSetting(InboxSeenKey + id, seen.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                return Json.Obj("inbox_seen", seen);
             }
             if (cmd == "agent.enroll" || cmd == "agent.update" || cmd == "agent.revoke" || cmd == "agent.reset" || cmd == "agent.rotate")
             {
@@ -271,7 +332,11 @@ namespace AgentRoom
                     db.Execute("UPDATE agents SET permission=?,instructions=?,connector=? WHERE id=?", permission, instructions, connector, target);
                 }
                 else if (cmd == "agent.revoke") db.Execute("UPDATE agents SET revoked=1,status='revoked',session='' WHERE id=?", target);
-                else db.Execute("UPDATE agents SET session='',mcp_session=?,status='not joined' WHERE id=?", NewMcpSession(target), target);
+                else
+                {
+                    if (Convert.ToInt64(existing["revoked"]) != 0) throw new RoomError("revoked", "A deregistered agent has no session to reset. Enroll a new identity instead.");
+                    db.Execute("UPDATE agents SET session='',mcp_session=?,status='not joined' WHERE id=?", NewMcpSession(target), target);
+                }
                 Audit(id, cmd, cmd == "agent.update" ? Json.Obj("agent", target, "permission", Json.Required(a, "permission", 20), "instructions", Json.Text(a, "instructions"), "connector", Json.Text(a, "connector", (string)existing["connector"])) : Json.Obj("agent", target), now);
                 return Json.Obj("agent", target);
             }
@@ -300,6 +365,9 @@ namespace AgentRoom
             {
                 Require(actor, "op", "coordinator");
                 RequireNotMuted(id, now);
+                // Every ticket brings deliveries with it, so creation needs a ceiling of its own. This one only stops a runaway.
+                if (!Is(actor, "op") && Count("SELECT COUNT(*) AS n FROM audit WHERE actor=? AND action='task.create' AND at>?", id, now - 3600) >= TicketsPerHour)
+                    throw new RoomError("rate_limited", "At most " + TicketsPerHour + " new tickets per hour. If more are really needed, ask the OP.");
                 long parent = Json.Number(a, "parent_id");
                 var parentTask = parent == 0 ? null : Task(parent);
                 string assigned = Json.Text(a, "assigned", "", 40);
@@ -309,6 +377,8 @@ namespace AgentRoom
                     parent == 0 ? null : (object)parent, parentTask == null ? null : parentTask["root_id"], assigned.Length == 0 ? null : assigned, Priority(a, "priority"), now, now);
                 long taskId = db.LastId;
                 if (parent == 0) db.Execute("UPDATE tasks SET root_id=id WHERE id=?", taskId);
+                // Subtasks share their root's budget; each one adds to it, so splitting work up is not what exhausts it.
+                else db.Execute("UPDATE tasks SET remaining=remaining+? WHERE id=?", SubtaskDeliveries, parentTask["root_id"]);
                 foreach (string dependency in Json.Strings(a, "dependencies", 20))
                 {
                     long dependencyId;
@@ -344,6 +414,7 @@ namespace AgentRoom
                 db.Execute("UPDATE tasks SET owner=?,state='active',version=version+1,worktree=?,reserved=?,branch=?,base_commit=?,updated_at=? WHERE id=?",
                     id, workspace == null ? "" : workspace.Path, workspace == null ? 0 : 1, workspace == null ? "" : workspace.Branch,
                     workspace == null ? "" : workspace.Commit, now, taskId);
+                FollowTickets(id);
                 Audit(id, cmd, Json.Obj("task", taskId, "owner", id), now);
                 return Task(taskId);
             }
@@ -366,6 +437,7 @@ namespace AgentRoom
                     throw new RoomError("paused", "Record a checkpoint or pause; new work is restricted.");
                 string checkpoint = Json.Required(a, "checkpoint");
                 db.Execute("UPDATE tasks SET state=?,checkpoint=?,version=version+1,updated_at=? WHERE id=?", state, checkpoint, now, taskId);
+                FollowTickets(task["owner"]);
                 Audit(id, cmd, Json.Obj("task", taskId, "state", state, "checkpoint", checkpoint), now);
                 return Task(taskId);
             }
@@ -400,6 +472,15 @@ namespace AgentRoom
             if (cmd == "escalate") return Escalate(actor, a, now);
             if (cmd == "escalation.update") return HandleEscalation(actor, a, now);
             if (cmd == "room.reset") return ResetChats(actor, a, now);
+            if (cmd == "room.wait")
+            {
+                Require(actor, "op");
+                long seconds = Json.Number(a, "seconds");
+                if (seconds < 60 || seconds > LongestWaitSeconds) throw new RoomError("invalid_argument", "Choose an idle wait between 60 and " + LongestWaitSeconds + " seconds.");
+                SetSetting("wait_seconds", seconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                Audit(id, cmd, Json.Obj("seconds", seconds), now);
+                return Json.Obj("wait_seconds", seconds);
+            }
             if (cmd == "worktree.release")
             {
                 Require(actor, "op");
@@ -426,6 +507,7 @@ namespace AgentRoom
             var original = ReplyTarget(actor, kind, a);
             bool agent = !Is(actor, "op");
             var recipients = new HashSet<string>(Json.Strings(a, "to", 4).Select(x => x.Trim().TrimStart('@').ToLowerInvariant()), StringComparer.Ordinal);
+            bool addressed = recipients.Count != 0;
             foreach (string recipient in recipients)
             {
                 if (agent && recipient == "op") throw new RoomError("use_escalate", "Agents reach the OP with the escalate operation, not messages.");
@@ -438,8 +520,9 @@ namespace AgentRoom
                 string handle = match.Groups[1].Value.ToLowerInvariant();
                 if ((agent && handle == "op") || db.One("SELECT id FROM agents WHERE id=? AND revoked=0", handle) == null) ignored.Add(handle); else recipients.Add(handle);
             }
-            // A reply with no explicit addressee goes back to the original author.
-            if (original != null && recipients.Count == 0 && (string)original["author"] != id && !(agent && (string)original["author"] == "op"))
+            // A reply goes back to the original author unless the sender names recipients in `to`. A mention in the
+            // body only adds people: it must not quietly take the requester off their own result.
+            if (original != null && !addressed && (string)original["author"] != id && !(agent && (string)original["author"] == "op"))
                 recipients.Add((string)original["author"]);
             recipients.Remove(id);
             if (recipients.Count > 4) throw new RoomError("invalid_argument", "At most four recipients per message.");
@@ -453,15 +536,30 @@ namespace AgentRoom
                 if (db.One("SELECT id FROM artifacts WHERE id=?", reference) == null) throw new RoomError("not_found", "Artifact not found.");
             bool actionable = kind != "note";
             if (actionable && (task == null || recipients.Count == 0)) throw new RoomError("invalid_argument", "Actionable messages need a ticket and recipient.");
+            // An observer cannot post, so an ask addressed to one would spend the budget and never be answered.
+            if (actionable) foreach (string recipient in recipients)
+                if ((string)db.One("SELECT permission FROM agents WHERE id=?", recipient)["permission"] == "observer")
+                    throw new RoomError("invalid_recipient", "@" + recipient + " is an observer and cannot reply. Address a worker, the coordinator, or the moderator, or send a note.");
             long recent = Convert.ToInt64(db.One("SELECT COUNT(*) AS n FROM messages WHERE author=? AND at>?", id, now - 60)["n"]);
             if (!Is(actor, "op") && recent >= 20) throw new RoomError("rate_limited", "At most 20 posts per minute. Wait before retrying.");
+            // An addressed note wakes its recipient and is free of the delivery budget, so each sender gets a small
+            // allowance per recipient. Without one, two agents could trade notes at the full posting rate.
+            if (kind == "note" && agent)
+            {
+                long allowance = Is(actor, "coordinator", "moderator") ? SupervisorNotes : WorkerNotes;
+                foreach (string recipient in recipients)
+                    if (Count("SELECT COUNT(*) AS n FROM messages m JOIN receipts r ON r.message_id=m.id WHERE m.author=? AND r.recipient=? AND m.kind='note' AND m.at>?", id, recipient, now - NoteWindowSeconds) >= allowance)
+                        throw new RoomError("rate_limited", "You sent @" + recipient + " " + allowance + " notes in the last 30 minutes, which is the limit. A note is for what someone must know now: put progress in a checkpoint, or ask with a request or question.");
+            }
+            // A result or answer to an ask closes an exchange instead of opening one, so the budget neither charges nor holds it.
+            bool closesAsk = original != null && (kind == "result" || kind == "answer");
             string held = "";
             var restriction = Restriction(id, now);
             if (restriction != null && (string)restriction["action"] == "mute") held = "Agent temporarily muted: " + (string)restriction["reason"];
             if (restriction != null && (string)restriction["action"] == "throttle" && db.One("SELECT id FROM messages WHERE author=? AND at>? LIMIT 1", id, now - 30) != null)
                 throw new RoomError("rate_limited", "Throttled: at most one post per 30 seconds.");
             if (actionable && Paused && !Is(actor, "op")) held = "Actionable delivery paused";
-            if (actionable && held.Length == 0)
+            if (actionable && held.Length == 0 && !closesAsk)
             {
                 var root = Task(Convert.ToInt64(task["root_id"]));
                 if (Convert.ToInt64(root["remaining"]) < recipients.Count && !Is(actor, "op")) held = "Root delivery budget exhausted";
@@ -501,7 +599,7 @@ namespace AgentRoom
             }
             string action = Json.Required(a, "action", 20);
             string reason = Json.Required(a, "reason", 1000);
-            string target = Json.Text(a, "target", "", 40);
+            string target = Json.Text(a, "target", "", 40).Trim().TrimStart('@').ToLowerInvariant();
             string[] evidence = Json.Strings(a, "evidence", 10);
             foreach (string item in evidence)
             {
@@ -511,8 +609,11 @@ namespace AgentRoom
             }
             long until = 0;
             bool isOperator = Is(actor, "op");
+            bool wasPaused = Paused;
             if (action == "pause" || action == "resume")
             {
+                // Pausing "one agent" would pause everyone; say so instead of doing it.
+                if (target != "") throw new RoomError("invalid_argument", "pause and resume apply to the whole room and take no target. To restrict one agent, use mute or throttle.");
                 bool operatorPause = Paused && Setting("paused_by") == "op";
                 if (!isOperator && action == "resume" && operatorPause) throw new RoomError("op_override", "The OP paused deliveries; only the OP can resume them.");
                 // A moderator pause during an OP pause keeps the OP as the owner of that pause.
@@ -543,6 +644,10 @@ namespace AgentRoom
                 Json.Write(target == "" ? new string[0] : new[] { target }));
             long messageId = db.LastId;
             if (target != "") db.Execute("INSERT INTO receipts(message_id,recipient) VALUES(?,?)", messageId, target);
+            if (action == "resume" && wasPaused && !Paused)
+                AnnounceCleared(id, now, null, "the room was resumed", "m.held_reason='Actionable delivery paused'");
+            if (action == "unmute")
+                AnnounceCleared(id, now, null, "@" + target + " is no longer muted", "m.author=? AND m.held_reason LIKE 'Agent temporarily muted:%'", target);
             return details;
         }
         private void AddDependency(long task, long dependency)
@@ -575,6 +680,22 @@ namespace AgentRoom
         }
         private Dictionary<string, object> Restriction(string id, long now) { return db.One("SELECT action,until_at,reason,imposed_by FROM restrictions WHERE target=? AND until_at>?", id, now); }
         private string Setting(string key) { var row = db.One("SELECT value FROM settings WHERE key=?", key); return row == null ? "" : (string)row["value"]; }
+        // The newest inbox mail a finished wait has reported to each agent. It lives in settings, not in a new
+        // column, so an older build still opens the room.
+        private const string InboxSeenKey = "inbox_seen:";
+        private long InboxSeen(string agent) { long seen; return Int64.TryParse(Setting(InboxSeenKey + agent), out seen) ? seen : 0; }
+        // How long a wait blocks when its caller names no timeout. Every timeout costs each idle agent a model call,
+        // so the OP can lengthen it where the harness keeps a long call alive.
+        internal const long DefaultWaitSeconds = 1500, LongestWaitSeconds = 86400;
+        private long WaitSeconds { get { long seconds; return Int64.TryParse(Setting("wait_seconds"), out seconds) ? seconds : DefaultWaitSeconds; } }
+        // An agent's status follows its tickets, so nobody spends a call reporting it: working while it owns an active
+        // ticket, available otherwise. A status set for another reason (paused, quota exhausted, disconnected) stays.
+        private void FollowTickets(object owner)
+        {
+            if (owner == null) return;
+            bool active = db.One("SELECT id FROM tasks WHERE owner=? AND state='active' LIMIT 1", owner) != null;
+            db.Execute("UPDATE agents SET status=? WHERE id=? AND id<>'op' AND status IN ('available','working')", active ? "working" : "available", owner);
+        }
         private bool Paused { get { return Setting("paused") == "true"; } }
         private void SetSetting(string key, string value) { db.Execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", key, value); }
         private void Audit(string actor, string action, object details, long now) { db.Execute("INSERT INTO audit(at,actor,action,details) VALUES(?,?,?,?)", now, actor, action, Json.Write(details)); }

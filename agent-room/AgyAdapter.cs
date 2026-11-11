@@ -183,6 +183,7 @@ namespace AgentRoom
                     WriteFile(BindingFile(session), Json.Write(Json.Obj("session", session, "profile", profilePath, "agent", agent, "pipe", pipe,
                         "credential_hash", Json.Hash(Json.Required(profile, "token", 128)))));
                     string command = Command(session);
+                    MarkBriefed(session, Json.Text(briefing, "version"), Json.Text(current, "permission"), Json.Text(current, "instructions"));
                     return Json.Ok(Json.Obj("agent", agent, "session", "agy:" + session, "permission", current["permission"], "instructions", current["instructions"],
                         "briefing", RoomService.BriefingSummary(briefing), "adapter_command", command, "context", Context(session, current, briefing)));
                 }
@@ -195,8 +196,13 @@ namespace AgentRoom
             var profile = BoundProfile(Binding(session));
             string cmd = Json.Required(request, "cmd", 40), id = Json.Text(request, "id", "", 100);
             if (cmd == "join") throw new RoomError("usage", "Use agy join --profile FILE --session ID for explicit joining.");
-            var response = cmd == "wait" ? Waiter.Run(profile, "agy:" + session, Json.Map(request, "args"), CancellationToken.None)
+            var response = cmd == "wait" ? Waiter.Run(profile, "agy:" + session, Json.Map(request, "args"), CancellationToken.None, Waiter.LongMaximum)
                 : Send(profile, session, cmd, Json.Map(request, "args"), id);
+            if (cmd == "briefing" && (bool)response["ok"])
+            {
+                var read = Json.Map(response, "result");
+                MarkBriefed(session, Json.Text(read, "version"), Json.Text(read, "role"), Json.Text(read, "instructions"));
+            }
             response["request_id"] = id;
             return response;
         }
@@ -206,14 +212,59 @@ namespace AgentRoom
             if (rawSession == "") rawSession = Json.Text(input, "session_id", "", 80);
             string session = Session(rawSession, null);
             if (!File.Exists(BindingFile(session))) return null;
-            var profile = BoundProfile(Binding(session));
-            var status = Success(Send(profile, session, "status", Json.Obj(), ""));
+            var binding = Binding(session);
+            var profile = BoundProfile(binding);
+            var state = ReadState(session);
+            bool stale = state == null || (state["needs"] is bool && (bool)state["needs"]);
+            Dictionary<string, object> status;
+            // One attempt only: this runs before every model call, and a hub that is down must not add seconds to each one.
+            try { status = Success(Wire.Call(profile, "agy:" + session, "status", Json.Obj(), "")); }
+            catch (RoomError e)
+            {
+                if (stale || (e.Code != "hub_unavailable" && e.Code != "connection_lost" && e.Code != "timeout")) throw;
+                return HookMessage(Pointer(session, Json.Required(binding, "agent", 40), Json.Text(state, "role"), Json.Text(state, "version")) +
+                    " The hub did not answer just now; room calls will fail until it is running again.");
+            }
+            string role = Json.Text(status, "permission"), version = Json.Text(status, "briefing_version");
+            string key = BriefingKey(version, role, Json.Text(status, "instructions"));
+            long steps = Json.Number(input, "initialNumSteps");
+            // The briefing sits in the transcript from the join or the last briefing call. It has to be sent again only
+            // when it changed, or when the trajectory got shorter, which means a compaction or restart dropped it.
+            stale = stale || Json.Text(state, "key") != key || (steps != 0 && steps < Json.Number(state, "steps"));
+            WriteState(session, stale ? (state == null ? "" : Json.Text(state, "key")) : key, stale, steps, role, version);
+            if (!stale) return HookMessage(Pointer(session, Json.Required(status, "self"), role, version));
             var briefing = Success(Send(profile, session, "briefing", Json.Obj(), ""));
-            return HookMessage(HookContext(session, status, briefing));
+            return HookMessage(HookContext(session, status, briefing,
+                "This briefing is not in your transcript, or it has changed. It is repeated before every model call until you run " + Command(session) +
+                " briefing once, which keeps it in your transcript; after that only a one-line reminder is sent.\n\n"));
         }
-        internal string HookContext(string session, Dictionary<string, object> status, Dictionary<string, object> briefing)
+        // What every later model call gets instead of the whole briefing: roughly a hundred tokens instead of three thousand.
+        private string Pointer(string session, string agent, string role, string version)
         {
-            string context = Context(session, status, briefing);
+            return "AgentRoom: you are @" + agent + " (" + role + "). Your briefing, version " + version + ", is in your transcript from your join or last briefing call. " +
+                "If you can no longer see it there, run " + Command(session) + " briefing before any room work. Every other room operation uses the same command.";
+        }
+        private static string BriefingKey(string version, string role, string instructions) { return version + "|" + role + "|" + Json.Hash(instructions ?? ""); }
+        private string StateFile(string session) { return Path.Combine(StateDirectory, "state", Json.Hash(session) + ".json"); }
+        private Dictionary<string, object> ReadState(string session)
+        {
+            if (!File.Exists(StateFile(session))) return null;
+            try { return Json.Read(File.ReadAllText(StateFile(session), Encoding.UTF8)); }
+            catch (Exception) { return null; }
+        }
+        private void WriteState(string session, string key, bool needs, long steps, string role, string version)
+        {
+            WriteFile(StateFile(session), Json.Write(Json.Obj("key", key, "needs", needs, "steps", steps, "role", role, "version", version)));
+        }
+        // The model has just been given the current briefing as an ordinary result, so it is in the transcript.
+        private void MarkBriefed(string session, string version, string role, string instructions)
+        {
+            var state = ReadState(session);
+            WriteState(session, BriefingKey(version, role, instructions), false, state == null ? 0 : Json.Number(state, "steps"), role, version);
+        }
+        internal string HookContext(string session, Dictionary<string, object> status, Dictionary<string, object> briefing, string note = "")
+        {
+            string context = note + Context(session, status, briefing);
             int bytes = Encoding.UTF8.GetByteCount(context);
             if (bytes <= HookContextBytes) return context;
             string directory = Path.Combine(StateDirectory, "briefings"), hash = Json.Hash(context);
